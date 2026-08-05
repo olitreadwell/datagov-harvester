@@ -173,6 +173,41 @@ class TestCKANUtils:
             )
         )
 
+    def test_translate_spatial_over_meridian_normalized_range(self):
+        # Longitudes already within the standard -180/180 range (e.g. 170
+        # and -170, common for Alaska/Aleutian-area federal data) still
+        # cross the antimeridian via the shorter path. Previously this
+        # produced a corrupted MultiPolygon with an empty second ring.
+        assert translate_spatial(
+            '{"type": "Polygon", "coordinates": '
+            "[[[170.0, 40.0], [170.0, 50.0], [-170.0, 50.0], "
+            "[-170.0, 40.0], [170.0, 40.0]]]}"
+        ) == (
+            json.dumps(
+                {
+                    "type": "MultiPolygon",
+                    "coordinates": [
+                        [
+                            [
+                                [170.0, 40.0],
+                                [170.0, 50.0],
+                                [-180.0, 50.0],
+                                [-180.0, 40.0],
+                                [170.0, 40.0],
+                            ],
+                            [
+                                [180.0, 50.0],
+                                [180.0, 40.0],
+                                [-170.0, 40.0],
+                                [-170.0, 50.0],
+                                [180.0, 50.0],
+                            ],
+                        ]
+                    ],
+                }
+            )
+        )
+
     def test_translate_spatial_geojson_fix(self):
         assert translate_spatial(
             {
