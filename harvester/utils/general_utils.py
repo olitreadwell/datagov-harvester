@@ -680,6 +680,11 @@ def crosses_meridian(val1, val2):
         return True, val1 - val2 > 0
     if longs[0] < -180 and longs[1] >= -180:
         return True, val1 - val2 > 0
+    # Both values are already within the standard -180/180 range, but the
+    # shorter path between them still crosses the antimeridian (e.g. 170 to
+    # -170 is 20 degrees apart going west, not 340 degrees going east).
+    if longs[1] - longs[0] > 180:
+        return True, val1 - val2 > 0
     return False, None
 
 
