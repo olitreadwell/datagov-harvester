@@ -105,6 +105,7 @@ class HarvestSource(Base):
     )
 
     name = Column(String, nullable=False)
+    description = Column(Text, nullable=True, index=True)
     url = Column(String, nullable=False, unique=True)
     notification_emails = Column(ARRAY(String))
 
@@ -149,7 +150,13 @@ class HarvestSource(Base):
         nullable=False,
     )
 
+    # default off: existing sources' notification emails (used for ops
+    # alerting) shouldn't change until explicitly opted in.
+    send_report_email = Column(Boolean, nullable=False, server_default="false")
+
+    is_locked = Column(Boolean, nullable=False, server_default=text("false"))
     collection_parent_url = Column(String)
+    date_next_run = Column(DateTime, index=True)
 
 
 # to avoid moving models around adding this here since it references
@@ -184,6 +191,7 @@ class HarvestJob(Base):
 
     job_type = Column(String(20), default="harvest")
     date_created = Column(DateTime, index=True, default=func.statement_timestamp())
+    date_started = Column(DateTime)
     date_finished = Column(DateTime)
 
     records_total = Column(Integer, default=0)
@@ -339,7 +347,8 @@ class Dataset(Base):
     last_harvested_date = Column(DateTime, index=True)
 
     # Mirrors HarvestRecord.record_type. A DatasetSeries gets "data_series"
-    # here so it's searchable/displayable like a dataset.
+    # and a DataService gets "data_service" here so each is
+    # searchable/displayable like a dataset.
     type = Column(
         Enum(*RECORD_TYPE_VALUES, name="record_type"),
         nullable=False,
@@ -426,6 +435,55 @@ class HarvestRecordError(Error):
     __table_args__ = (
         Index("ix_hre_job_id", "harvest_job_id"),
         Index("ix_harvest_record_error_harvest_record_id", "harvest_record_id"),
+    )
+
+
+class HarvestRecordCurrentIssue(Base):
+    """Current issues per (harvest_source, record_type, identifier),
+    independent of any job. Deleted-and-reinserted on each reprocess, so an
+    unchanged record keeps showing its issue instead of losing it just
+    because it got no new harvest_record row this job. See #6440.
+
+    id is the id of the harvest_record_error row this mirrors, not an
+    independently generated UUID, so an issue shown here and the error it
+    came from always share one id/date_created/type/message/severity/
+    harvest_record_id - there is exactly one row of data, this table just
+    indexes it by (harvest_source, record_type, identifier) instead of by
+    job. Cascades with that error row, so deleting the job that produced
+    it also removes the now-stale current-issue pointer.
+    """
+
+    __tablename__ = "harvest_record_current_issue"
+
+    id = Column(
+        String(36),
+        ForeignKey("harvest_record_error.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+
+    harvest_source_id = Column(
+        String(36),
+        ForeignKey("harvest_source.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+
+    record_type = Column(
+        Enum(*RECORD_TYPE_VALUES, name="record_type"),
+        nullable=False,
+        server_default="dataset",
+    )
+
+    identifier = Column(String, nullable=False)
+
+    error = relationship("HarvestRecordError", lazy=True)
+
+    __table_args__ = (
+        Index(
+            "ix_harvest_record_current_issue_source_type_identifier",
+            "harvest_source_id",
+            "record_type",
+            "identifier",
+        ),
     )
 
 

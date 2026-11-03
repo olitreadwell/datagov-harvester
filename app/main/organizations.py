@@ -29,16 +29,28 @@ def add_organization():
     form = OrganizationForm(db_interface=deps.db)
     if form.validate_on_submit():
         new_org = make_new_org_contract(form)
+
         org = deps.db.add_organization(new_org)
         if org:
             _log_mutation("create", "organization", org.id, organization_slug=org.slug)
-            flash(f"Added new organization with ID: {org.id}")
+            flash(f"Added new organization with ID: {org.id}", "success")
+            # Show warning if both URL and exempt flag are set
+            if form.has_conflict():
+                flash(
+                    (
+                        "Warning: Organization has both a repository URL "
+                        "and an exemption flag set."
+                    ),
+                    "warning",
+                )
         else:
-            flash("Failed to add organization.")
+            flash("Failed to add organization.", "error")
         return redirect(url_for("main.organization_list"))
     elif form.errors:
-        flash(form.errors)
-        return redirect(url_for("main.add_organization"))
+        # Flash individual error messages
+        for field, errors in form.errors.items():
+            for error in errors:
+                flash(error, "error")
     return render_template(
         "edit_data.html",
         form=form,
@@ -58,9 +70,8 @@ def view_organization(org_identifier: str):
     sources = deps.db.get_harvest_source_by_org(org_id)
     future_harvest_jobs = {}
     for source in sources:
-        job = deps.db.get_new_harvest_jobs_by_source_in_future(source.id)
-        if len(job):
-            future_harvest_jobs[source.id] = job[0].date_created
+        if source.date_next_run:
+            future_harvest_jobs[source.id] = source.date_next_run
     harvest_jobs = {}
     for source in sources:
         job = deps.db.get_first_harvest_job_by_filter(
@@ -93,7 +104,7 @@ def update_organization_actions(org_identifier: str):
     form = OrganizationTriggerForm()
 
     if not form.validate_on_submit():
-        flash(form.errors)
+        flash(form.errors, "error")
         return redirect(
             url_for("main.view_organization", org_identifier=org_url_identifier)
         )
@@ -110,7 +121,7 @@ def update_organization_actions(org_identifier: str):
                 organization_slug=org_url_identifier,
                 status=status,
             )
-            flash(message)
+            flash(message, "success" if status == 200 else "error")
             if status == 409:
                 return redirect(
                     url_for(
@@ -123,7 +134,7 @@ def update_organization_actions(org_identifier: str):
         except Exception as e:
             message = f"Failed to delete organization :: {repr(e)}"
             logger.error(message)
-            flash(message)
+            flash(message, "error")
             return redirect(
                 url_for(
                     "main.view_organization",
@@ -144,12 +155,22 @@ def edit_organization(org_id):
     form = OrganizationForm(organization_id=org_id, data=org, db_interface=deps.db)
     if form.validate_on_submit():
         new_org_data = make_new_org_contract(form)
+
         org = deps.db.update_organization(org_id, new_org_data)
         if org:
             _log_mutation("edit", "organization", org.id, organization_slug=org.slug)
-            flash(f"Updated org with ID: {org.id}")
+            flash(f"Updated org with ID: {org.id}", "success")
+            # Show warning if both URL and exempt flag are set
+            if form.has_conflict():
+                flash(
+                    (
+                        "Warning: Organization has both a repository URL "
+                        "and an exemption flag set."
+                    ),
+                    "warning",
+                )
         else:
-            flash("Failed to update organization.")
+            flash("Failed to update organization.", "error")
         return redirect(
             url_for(
                 "main.view_organization",
@@ -157,8 +178,10 @@ def edit_organization(org_id):
             )
         )
     elif form.errors:
-        flash(form.errors)
-        return redirect(url_for("main.edit_organization", org_id=org_id))
+        # Flash individual error messages
+        for field, errors in form.errors.items():
+            for error in errors:
+                flash(error, "error")
 
     return render_template(
         "edit_data.html",

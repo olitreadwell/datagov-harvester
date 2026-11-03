@@ -4,6 +4,10 @@ We use docker containers to run the application locally.
 
 ## Running the app
 
+Make sure the DCAT-US 3.0 schema submodule is checked out first — see
+[DCAT-US 3.0 schemas](#dcat-us-30-schemas). If you cloned with
+`git clone --recurse-submodules`, you already have it.
+
 Build the static assets (requires `npm`):
 
 ```
@@ -93,6 +97,113 @@ We use [Ruff](https://github.com/astral-sh/ruff) to format and lint our Python f
  - This repo contains pre-commit actions. Learn how to configure your IDE to run those [here](https://pre-commit.com/).
  - Create a branch from `main`. We prefer short descriptive branch names.
  - To test changes in the `development` space in Cloud.gov, merge changes into the `develop` branch. Coordinate with other developers by announcing your plans in #datagov-devsecops.
+
+## Alert banners
+
+Every `flash()` call passes an explicit category, and
+`app/templates/components/alert.j2` is the only place that maps a category to
+a USWDS alert class:
+
+| Category  | Color  | Use for                                                    |
+|-----------|--------|------------------------------------------------------------|
+| `success` | green  | the requested action completed                             |
+| `warning` | yellow | partial success, a non-fatal problem, or nothing changed   |
+| `error`   | red    | the action failed, or the input or link was invalid        |
+| `info`    | blue   | neutral information that reports no action outcome         |
+
+`LoadManager` methods that report to the UI (`trigger_manual_job`,
+`start_job`, `stop_job`) return a `(message, category)` tuple, so callers can
+flash the message without parsing it.
+
+## DCAT-US 3.0 schemas
+
+The DCAT-US 3.0 JSON Schemas are **not in this repo**. They come from
+[GSA/dcat-us](https://github.com/GSA/dcat-us), tracked as a git submodule at
+`_external/dcat-us`. Paths are defined once, in
+[`dcatus_validation/schema_paths.py`](../dcatus_validation/schema_paths.py) — import
+from there rather than rebuilding paths from `__file__`.
+
+Don't edit anything under `_external/dcat-us`. It belongs to `GSA/dcat-us`; open
+a PR against that repo instead. A commit here records only which `dcat-us`
+commit to check out, never file contents.
+
+DCAT-US **1.1** is different — it has no `GSA/dcat-us` equivalent and stays
+vendored in this repo under `schemas/dcatus1.1/`.
+
+### Getting the schemas
+
+Cloning fresh:
+
+```
+% git clone --recurse-submodules https://github.com/GSA/datagov-harvester.git
+```
+
+If you already cloned without that flag:
+
+```
+% git submodule update --init _external/dcat-us
+```
+
+To stop having to remember the flag on every clone and pull:
+
+```
+% git config --global submodule.recurse true
+```
+
+### If the submodule is missing
+
+An uninitialized submodule leaves `_external/dcat-us` as an **empty directory**,
+not a missing one, so the failure is easy to misread. Two things to know:
+
+- **`make build` will not fix it.** `docker-compose.yml` bind-mounts `.:/app`, so
+  the container sees your host working tree, empty directory included. Rebuilding
+  the image accomplishes nothing.
+- **The symptom** is a `FileNotFoundError` from `build_dcatus3_validator` naming
+  the directory and the fix. Anything touching DCAT-US 3.0 validation raises it,
+  including at test-collection time.
+
+Confirm with `git submodule status`. A leading `-` means uninitialized:
+
+```
+-24f6f1e...  _external/dcat-us        # not initialized — run the update above
+ 24f6f1e...  _external/dcat-us (...)  # good (note the leading space)
++abc1234...  _external/dcat-us (...)  # checked out at a different commit than pinned
+```
+
+Don't use sparse-checkout inside the submodule. Sparse patterns live in
+`.git/modules/_external/dcat-us/info/sparse-checkout`, which **cannot be
+committed**, so CI and fresh clones get the full tree regardless. All it does is
+make your machine disagree with CI about which schema files exist — in the one
+code path whose entire job is schema validation.
+
+### Upgrading to a newer dcat-us
+
+The submodule is pinned to a specific `dcat-us` commit on purpose, so upgrades
+are deliberate. Dependabot opens a monthly PR that bumps it; you can also do it
+by hand.
+
+Note that `--remote` follows the branch named in `.gitmodules`, which is
+**`dcat-us`'s `main`** — not this repo's `main`.
+
+```
+% git -C _external/dcat-us rev-parse HEAD          # record the old SHA first
+% git submodule update --remote _external/dcat-us
+```
+
+Review what actually moved, then test:
+
+```
+% git diff --submodule=log                          # commit range
+% git -C _external/dcat-us diff "$old" HEAD -- jsonschema/definitions
+% poetry run pytest tests/unit
+```
+
+Commit **only** the gitlink (`_external/dcat-us`) — there are no file changes to
+stage.
+
+A schema change can legitimately alter which harvest records validate, so
+**failing tests here are the point of pinning, not an obstacle.** Fix the code or
+reject the bump. Never skip the tests to land the SHA.
 
 ## Local development
 
@@ -221,6 +332,13 @@ A user provided service by the name of `datagov-harvest-secrets` is also expecte
 
 CF_SERVICE_* variables can be extracted from from service-keys by running `cf service-key ci-deployer datagov-harvest-deployer` in the appropriate space.
 
+`datagov-harvest-validator` binds only its own `datagov-harvest-validator-secrets`, never `datagov-harvest-secrets`, so the public validator (it takes server-side URL-fetch requests) holds none of the admin app's secrets (GSA/data.gov#6293). It needs just one value; `create_cloudgov_services.sh` creates the service empty if missing, then populate it once per space:
+
+```bash
+cf uups datagov-harvest-validator-secrets -p '{"NEW_RELIC_LICENSE_KEY": "<same value as datagov-harvest-secrets>"}'
+cf restage datagov-harvest-validator
+```
+
 ### Manually Deploying the Flask Application to development
 
 Note: we prefer that you deploy to the development environment by pushing to the `develop` branch, which triggers deployment. That approach provides better team visibility. However, there are circumstances where deploying from the command line is necessary; for example if a failing action is preventing deployment.
@@ -246,20 +364,40 @@ Note: we prefer that you deploy to the development environment by pushing to the
 ## Applications
 
 ### datagov-harvest-proxy
-This is an nginx app which owns the public route and proxies traffic to the internal Flask app route.
+This is an nginx app which owns the public route and proxies traffic to the internal Flask app route. It also splits off validator traffic: `/api/validate`, `/api/v1/validate`, the validator's docs at `/validator/docs` and `/validator/openapi.json`, and its health check at `/validator/health` are proxied to `datagov-harvest-validator` instead of `datagov-harvest` (see `proxy/nginx-common.conf` and `proxy/nginx-maps.conf`). Everything else, including the `/validate/` page, goes to `datagov-harvest`.
 
 ### datagov-harvest
 This is a Flask app which manages the configuration of harvest sources, organizations, and the creation of harvest jobs.
 
+### datagov-harvest-validator
+The public DCAT-US validation API, deployed as its own Cloud Foundry app so validation load and its server-side URL fetching can't consume the admin app's capacity, and can be scaled or restarted on their own (GSA/data.gov#6293).
+
+- **Minimal on purpose.** It runs `validator_api/` (`validator-start.sh`), not the admin app: it imports only `dcatus_validation/`, APIFlask and marshmallow, so it needs no database, no admin secrets and no CF credentials. `tests/unit/test_validator_import_clean.py` fails if it ever imports `app`, `harvester` or `database`.
+- **One copy of the validation code.** `dcatus_validation/` holds the error-message formatting, the schema paths, `validate_records` and the URL fetcher. The harvest runner imports the same module, so the validator and a harvest job describe a bad record the same way.
+- **The `/validate/` page doesn't call it server-side.** `datagov-harvest` only renders the page (GET only); the browser `fetch()`es `/api/v1/validate` same-origin through the proxy (`app/static/js/view_validators.js`), so the admin app's workers are never involved.
+- **URL fetches** get one 12s budget, with each connect attempt capped at 4s and retried up to 3 times on a fresh connection (`dcatus_validation/fetch.py`). Private and internal addresses are refused unless `ALLOW_PRIVATE_ADDRESSES=true` (local `docker compose` only).
+- Its docs are at `/validator/docs`, linked from the admin app's `/openapi/docs`.
+- **Health check:** `/health` on the internal route (Cloud Foundry's health check) and `/validator/health` through the proxy (uptime monitoring). Every schema validator is built at startup, so an instance with missing schemas fails to start rather than reporting healthy.
+- **Security:** the SSRF protections, resource limits and rules for changing this code are in [validator-security.md](validator-security.md).
+- Has its own `validator_instances`/`validator_memory_quota`/`validator_disk_quota` vars per space, separate from `admin_*`. gunicorn runs 3 workers × 2 threads per instance.
+
+Locally, `docker compose` runs it as the `validator` service, plus a `proxy` service (`nginx-local-proxy.conf`, port 8082) that reproduces the cloud.gov routing and body limits, since the Flask dev server has no nginx in front of it. `/validate/` only works end to end through port 8082.
+
 #### User management
 
-The Data.gov team are the only intended users of the harvester admin app.
+The Data.gov team are the only intended users of the harvester admin app. Since users are rarely added or deleted, no user management UI has been built and adding/deleting users must be done via the command line.
+
+To add a user:
 
 `cf run-task datagov-harvest --name "add new user" --command "flask user add xxx@gsa.gov --name xxx"`
 
 Or, if doing for local development:
 
 `docker compose exec app flask user add your.i.name@gsa.gov --name yourName`
+
+To delete a user:
+
+`cf run-task datagov-harvest --command "flask user remove xxx@gsa.gov"`
 
 #### Add organizations
 

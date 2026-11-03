@@ -113,6 +113,69 @@ class TestHarvestJobFullFlow:
         )
 
     @patch("harvester.harvest.HarvestSource.send_notification_emails")
+    def test_harvest_dcatus3_0_spatial_and_temporal_persisted(
+        self,
+        send_notification_emails_mock: MagicMock,
+        interface,
+        organization_data,
+        source_data_dcatus3_0_with_spatial_temporal,
+    ):
+        """AC: a DCAT-US 3.0 dataset with a well-formed spatial Location and a
+        populated temporal PeriodOfTime array is harvested with both fields
+        translated/persisted correctly (GSA/data.gov#6038)."""
+        interface.add_organization(organization_data)
+        interface.add_harvest_source(source_data_dcatus3_0_with_spatial_temporal)
+        harvest_job = interface.add_harvest_job(
+            {
+                "status": "new",
+                "harvest_source_id": (
+                    source_data_dcatus3_0_with_spatial_temporal["id"]
+                ),
+            }
+        )
+
+        job_id = harvest_job.id
+        harvest_job_starter(job_id, "harvest")
+
+        harvest_job = interface.get_harvest_job(job_id)
+        assert harvest_job.status == "complete"
+        assert harvest_job.records_added == 1
+        assert harvest_job.record_errors == []
+
+        datasets = interface.db.query(Dataset).all()
+        assert len(datasets) == 1
+        dataset = datasets[0]
+        assert dataset.harvest_source_id == (
+            source_data_dcatus3_0_with_spatial_temporal["id"]
+        )
+
+        assert dataset.translated_spatial == {
+            "type": "Polygon",
+            "coordinates": [
+                [
+                    [-125.0, 24.0],
+                    [-66.0, 24.0],
+                    [-66.0, 50.0],
+                    [-125.0, 50.0],
+                    [-125.0, 24.0],
+                ]
+            ],
+        }
+
+        assert dataset.dcat["temporal"] == [
+            {
+                "@type": "PeriodOfTime",
+                "startDate": "2020-01-01",
+                "endDate": "2020-12-31",
+            }
+        ]
+
+        # notification email was sent (configured to "always")
+        assert send_notification_emails_mock.called
+        # the record was added as intended (not errored)
+        assert send_notification_emails_mock.call_args.args[0]["records_added"] == 1
+
+    @patch("harvester.harvest.HarvestSource.send_notification_emails")
     def test_harvest_dcatus3_0_dataset_and_data_service_independent(
         self,
         send_notification_emails_mock: MagicMock,
@@ -121,7 +184,9 @@ class TestHarvestJobFullFlow:
         source_data_dcatus3_0_with_services,
     ):
         """AC: a source with both Dataset and DataService objects harvests
-        each independently of the other."""
+        each independently of the other. Each DataService also persists as
+        a Dataset row (type="data_service") so it's searchable and
+        displayable like a dataset."""
         interface.add_organization(organization_data)
         interface.add_harvest_source(source_data_dcatus3_0_with_services)
         harvest_job = interface.add_harvest_job(
@@ -138,13 +203,19 @@ class TestHarvestJobFullFlow:
         assert harvest_job.status == "complete"
         assert harvest_job.records_added == 3
 
-        # only the Dataset record gets a Dataset row; DataService records
-        # are persisted as HarvestRecords only.
         datasets = interface.db.query(Dataset).all()
-        assert len(datasets) == 1
-        assert datasets[0].harvest_source_id == (
-            source_data_dcatus3_0_with_services["id"]
+        assert len(datasets) == 3
+        assert all(
+            d.harvest_source_id == source_data_dcatus3_0_with_services["id"]
+            for d in datasets
         )
+        dataset_datasets = [d for d in datasets if d.type == "dataset"]
+        service_datasets = [d for d in datasets if d.type == "data_service"]
+        assert len(dataset_datasets) == 1
+        assert {d.dcat["identifier"] for d in service_datasets} == {
+            "https://example.gov/services/one",
+            "https://example.gov/services/two",
+        }
 
         records = (
             interface.db.query(HarvestRecord)
@@ -236,7 +307,9 @@ class TestHarvestJobFullFlow:
     ):
         """AC: a Dataset embedded in a DataService's servesDataset is
         harvested as a real Dataset, tagged with the service's identifier
-        as its parent."""
+        as its parent. The DataService itself also persists as a Dataset
+        row (type="data_service") so it's searchable and displayable like
+        a dataset."""
         interface.add_organization(organization_data)
         interface.add_harvest_source(source_data_dcatus3_0_service_serves_dataset)
         harvest_job = interface.add_harvest_job(
@@ -256,11 +329,19 @@ class TestHarvestJobFullFlow:
         assert harvest_job.records_added == 2
 
         datasets = interface.db.query(Dataset).all()
-        assert len(datasets) == 1
-        assert datasets[0].dcat["identifier"] == (
+        assert len(datasets) == 2
+        served_datasets = [d for d in datasets if d.type == "dataset"]
+        service_datasets = [d for d in datasets if d.type == "data_service"]
+        assert len(served_datasets) == 1
+        assert served_datasets[0].dcat["identifier"] == (
             "https://example.gov/datasets/served-by-service-one"
         )
-        assert datasets[0].dcat["isPartOf"] == "https://example.gov/services/one"
+        assert served_datasets[0].dcat["isPartOf"] == "https://example.gov/services/one"
+        assert len(service_datasets) == 1
+        assert service_datasets[0].dcat["identifier"] == (
+            "https://example.gov/services/one"
+        )
+        assert "isPartOf" not in service_datasets[0].dcat
 
         records = (
             interface.db.query(HarvestRecord)
@@ -345,6 +426,57 @@ class TestHarvestJobFullFlow:
         assert series_records[0].identifier == (
             "https://example.gov/series/annual-report"
         )
+
+    @patch("harvester.harvest.HarvestSource.send_notification_emails")
+    def test_harvest_dcatus1_1_ispartof_persists_parent(
+        self,
+        send_notification_emails_mock: MagicMock,
+        interface,
+        organization_data,
+        source_data_dcatus1_1_ispartof,
+    ):
+        """AC: a DCAT-US 1.1 dataset's "isPartOf" field is read as its
+        parent_identifier, the same way DCAT-US 3.0 series/service
+        membership is."""
+        interface.add_organization(organization_data)
+        interface.add_harvest_source(source_data_dcatus1_1_ispartof)
+        harvest_job = interface.add_harvest_job(
+            {
+                "status": "new",
+                "harvest_source_id": source_data_dcatus1_1_ispartof["id"],
+            }
+        )
+
+        job_id = harvest_job.id
+        harvest_job_starter(job_id, "harvest")
+
+        harvest_job = interface.get_harvest_job(job_id)
+        assert harvest_job.status == "complete"
+        assert harvest_job.records_added == 2
+
+        records = (
+            interface.db.query(HarvestRecord)
+            .filter(
+                HarvestRecord.harvest_source_id == source_data_dcatus1_1_ispartof["id"]
+            )
+            .all()
+        )
+        assert len(records) == 2
+
+        child_record = next(
+            r
+            for r in records
+            if r.identifier == "https://example.gov/datasets/annual-report-2024"
+        )
+        parent_record = next(
+            r
+            for r in records
+            if r.identifier == "https://example.gov/collections/annual-report"
+        )
+        assert child_record.parent_identifier == (
+            "https://example.gov/collections/annual-report"
+        )
+        assert parent_record.parent_identifier is None
 
     @patch("harvester.harvest.HarvestSource.send_notification_emails")
     def test_multiple_harvest_jobs(
@@ -582,18 +714,18 @@ class TestHarvestJobFullFlow:
         assert len(harvest_job.record_errors) == 4
         assert harvest_job.records_errored == 4
 
+        collection_parent_url = source_data_waf_collection["collection_parent_url"]
         for record in harvest_job.records:
             if record.status == "success":
-                assert (
-                    record.parent_identifier
-                    == source_data_waf_collection["collection_parent_url"]
-                )
+                if record.identifier == collection_parent_url:
+                    # the collection root itself has no parent
+                    assert record.parent_identifier is None
+                    continue
+
+                assert record.parent_identifier == collection_parent_url
 
                 # make sure the parent url is in the transformed dcat data in the dataset
-                assert (
-                    record.dataset.dcat["isPartOf"]
-                    == source_data_waf_collection["collection_parent_url"]
-                )
+                assert record.dataset.dcat["isPartOf"] == collection_parent_url
         # call on error
         assert send_notification_emails_mock.called
 
@@ -744,10 +876,12 @@ class TestHarvestJobFullFlow:
         assert f"Job {harvest_job2.id} is already in progress for source" in caplog.text
         assert harvest_job.status == "error"
 
+    @patch("harvester.harvest.HarvestSource.send_notification_emails")
     @patch("requests.get")
     def test_critical_job_error_status_not_overwritten(
         self,
         mock_get,
+        send_notification_emails_mock: MagicMock,
         interface,
         organization_data,
         source_data_dcatus_single_record,
@@ -769,6 +903,11 @@ class TestHarvestJobFullFlow:
 
         harvest_job = interface.get_harvest_job(harvest_job.id)
         assert harvest_job.status == "error"
+
+        # a job-level error triggers notifications even though no individual
+        # records were errored, so "on_error" sources aren't left silent
+        send_notification_emails_mock.assert_called_once()
+        assert send_notification_emails_mock.call_args.kwargs["job_status"] == "error"
 
         harvest_source.db_interface.close()
 
@@ -816,13 +955,75 @@ class TestHarvestJobFullFlow:
         # the record was added as intended (not errored)
         assert send_notification_emails_mock.call_args.args[0]["records_added"] == 1
 
+    @patch("harvester.harvest.HarvestSource.send_notification_emails")
+    def test_can_translate_wkt_spatial(
+        self,
+        send_notification_emails_mock: MagicMock,
+        interface,
+        organization_data,
+        source_data_dcatus_wkt_spatial,
+    ):
+        interface.add_organization(organization_data)
+        interface.add_harvest_source(source_data_dcatus_wkt_spatial)
+        harvest_job = interface.add_harvest_job(
+            {
+                "status": "new",
+                "harvest_source_id": source_data_dcatus_wkt_spatial["id"],
+            }
+        )
+
+        job_id = harvest_job.id
+        harvest_job_starter(job_id, "harvest")
+
+        harvest_job = interface.get_harvest_job(job_id)
+
+        latest_records = interface.get_latest_harvest_records_by_source(
+            source_data_dcatus_wkt_spatial["id"]
+        )
+        assert len(latest_records) == 1
+
+        # a WKT spatial value should translate cleanly, with no warning raised
+        assert harvest_job.record_errors == []
+
+        datasets = interface.db.query(Dataset).all()
+        assert len(datasets) == 1
+        assert datasets[0].translated_spatial == {
+            "type": "Polygon",
+            "coordinates": [
+                [
+                    [-125.0, 24.0],
+                    [-66.0, 24.0],
+                    [-66.0, 50.0],
+                    [-125.0, 50.0],
+                    [-125.0, 24.0],
+                ]
+            ],
+        }
+
+        # notification email was sent (configured to "always")
+        assert send_notification_emails_mock.called
+        # the record was added as intended (not errored)
+        assert send_notification_emails_mock.call_args.args[0]["records_added"] == 1
+
 
 class TestCheckMoreWork:
     @patch("harvester.lib.cf_handler.CloudFoundryClient")
     def test_check_more_work(
-        self, CFCMock, interface, organization_data, source_data_dcatus_single_record
+        self,
+        CFCMock,
+        interface,
+        organization_data,
+        source_data_dcatus_single_record,
+        monkeypatch,
     ):
         """Check more work starts another task."""
+        # create_task_handler() only picks CFHandler when all three CF_* vars
+        # are set; .env.sample ships CF_SERVICE_USER/CF_SERVICE_AUTH empty, so
+        # without this the job starts via LocalTaskHandler and CFCMock is
+        # never called.
+        monkeypatch.setenv("CF_API_URL", "https://api.example.com")
+        monkeypatch.setenv("CF_SERVICE_USER", "user")
+        monkeypatch.setenv("CF_SERVICE_AUTH", "pass")
 
         interface.add_organization(organization_data)
         interface.add_harvest_source(source_data_dcatus_single_record)

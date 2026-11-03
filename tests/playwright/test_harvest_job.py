@@ -29,8 +29,6 @@ class TestHarvestJobUnauthed:
         expect(table).to_contain_text("error")  # From fixtures
         expect(table).to_contain_text("Job type")
         expect(table).to_contain_text("harvest")
-        expect(table).to_contain_text("Records total")
-        expect(table).to_contain_text("10")
         expect(table).to_contain_text("Records added")
         expect(table).to_contain_text("2")
         expect(table).to_contain_text("Records updated")
@@ -47,6 +45,7 @@ class TestHarvestJobUnauthed:
 
         # Test that date fields exist but don't check exact values
         expect(table).to_contain_text("Date created")
+        expect(table).to_contain_text("Date started")
         expect(table).to_contain_text("Date finished")
 
     def test_harvest_job_record_errors_display(self, upage):
@@ -56,10 +55,12 @@ class TestHarvestJobUnauthed:
             10
         )  # paginated at 10 entries
 
+        # Target by identifier, not position: the grouped query has no
+        # ORDER BY, so which block renders first isn't stable across runs.
         expect(
-            upage.locator(
-                "#error_results_pagination .error-list .error-block:first-child p a"
-            )
+            upage.locator("#error_results_pagination .error-list .error-block")
+            .filter(has_text="test_identifier-1")
+            .locator("p a")
         ).to_have_attribute(
             "href",
             "/api/v1/harvest_record/0779c855-df20-49c8-9108-66359d82b77c",
@@ -78,9 +79,13 @@ class TestHarvestJobUnauthed:
         )
 
     def test_harvest_job_validation_errors_aggregated(self, upage):
-        validation_msgs = upage.locator(
-            "#error_results_pagination .error-list .error-block:first-child ul li"
-        ).all()
+        # test_identifier-1 has two aggregated validation messages.
+        validation_msgs = (
+            upage.locator("#error_results_pagination .error-list .error-block")
+            .filter(has_text="test_identifier-1")
+            .locator("ul li")
+            .all()
+        )
 
         assert len(validation_msgs) == 2
 
@@ -139,6 +144,10 @@ class TestHarvestJobUnauthed:
         # glossary starts closed
         assert glossary.get_attribute("aria-hidden") == "true"
 
+        # Wait for glossary terms to be added by JavaScript
+        upage.locator(f"span[data-term='{data_term_name}']").wait_for(
+            state="attached", timeout=5000
+        )
         upage.click(f"span[data-term='{data_term_name}']")
         assert glossary.get_attribute("aria-hidden") == "false"
         glossary_elem = upage.locator(

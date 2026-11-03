@@ -7,15 +7,27 @@ from urllib.parse import urlsplit
 
 from apiflask import APIFlask
 from dotenv import load_dotenv
-from flask import g, request, session
+from flask import g, jsonify, render_template, request, session
 from flask_htmx import HTMX
 from flask_migrate import Migrate
 from flask_talisman import Talisman
+from werkzeug.exceptions import RequestEntityTooLarge
 
-from app.filters import else_na, humanize, usa_icon, utc_isoformat
+from app.constants import MAX_UPLOAD_BYTES, MAX_UPLOAD_MB
+from app.filters import (
+    elapsed_time,
+    else_na,
+    humanize,
+    running_elapsed_time,
+    usa_icon,
+    utc_isoformat,
+)
+from app.json_provider import ISO8601JSONProvider
 from app.local_dev_auth import is_running_on_cloud_foundry
 from app.startup_validation import validate_required_env_vars
 from config.logger_config import LOGGING_CONFIG
+from config.security import HSTS_HEADER as HSTS_HEADER
+from config.security import TALISMAN_BASELINE_OPTIONS
 from database.models import db
 from scripts.sync_datasets import register_cli
 
@@ -28,8 +40,6 @@ logging.config.dictConfig(LOGGING_CONFIG)
 
 # fixes a bug with Flask-HTMX not being able to find the app context
 htmx = None
-HSTS_MAX_AGE_SECONDS = 60 * 60 * 24 * 365
-HSTS_HEADER = f"max-age={HSTS_MAX_AGE_SECONDS}; includeSubDomains; preload"
 
 _VERSIONED_API_PATH = re.compile(r"^/api/(v\d+)/([^/]+)")
 
@@ -91,6 +101,7 @@ def create_app():
     app = VersionedStaticAPIFlask(
         __name__, static_url_path="", static_folder="static", docs_path=None
     )
+    app.json = ISO8601JSONProvider(app)
 
     # OpenAPI fields
     app.config["INFO"] = {
@@ -143,7 +154,10 @@ def create_app():
     if os.getenv("FLASK_ENV") != "production":
         # Pick up template edits during local dev without restarting the process.
         app.config["TEMPLATES_AUTO_RELOAD"] = True
-    app.config["MAX_CONTENT_LENGTH"] = 10 * 1024 * 1024
+    app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_BYTES
+    # Flask 3.1 caps non-file form fields at 500KB by default, which rejected
+    # pasted catalogs far below MAX_CONTENT_LENGTH.
+    app.config["MAX_FORM_MEMORY_SIZE"] = MAX_UPLOAD_BYTES
     app.config["SESSION_COOKIE_NAME"] = os.getenv(
         "SESSION_COOKIE_NAME", "harvest_session"
     )
@@ -154,6 +168,12 @@ def create_app():
     app.config["SESSION_IDLE_TIMEOUT_SECONDS"] = int(
         os.getenv("SESSION_IDLE_TIMEOUT_SECONDS", "900")
     )
+    # GSA/data.gov#6293: the validator shares its external domain with the
+    # admin app (nginx just proxies a few paths to it), so without its own
+    # cookie names its session/auth cookies would overwrite the admin app's
+    # and log admin users out. Set via SESSION_COOKIE_NAME/AUTH_COOKIE_NAME
+    # in manifest.yml for the validator app.
+    app.config["SERVED_BY"] = os.getenv("SERVED_BY", "datagov-harvest")
     from app.static_assets import get_asset_version
 
     app.config["ASSET_VERSION"] = get_asset_version(app.static_folder)
@@ -267,6 +287,11 @@ def create_app():
         method = request.method
         has_session_user = bool(session.get("user"))
 
+        # GSA/data.gov#6293: lets New Relic synthetic checks confirm a
+        # /validate request actually reached the validator app rather than
+        # the admin app (nginx routes them separately - see proxy/nginx.conf).
+        response.headers["X-Served-By"] = app.config["SERVED_BY"]
+
         if getattr(g, "clear_session_cookie", False):
             response = clear_session_cookie(response)
 
@@ -282,6 +307,10 @@ def create_app():
         if path.startswith(("/login", "/callback", "/logout")) or path == "/login/oidc":
             return set_private_no_store(response)
 
+        if path == "/harvest_source/refresh":
+            response.headers["Referrer-Policy"] = "no-referrer"
+            return set_private_no_store(response)
+
         if request.endpoint == "static":
             return set_public_cache(response, 3600)
 
@@ -292,6 +321,23 @@ def create_app():
             return set_private_no_store(response)
 
         return set_public_cache(response, 60)
+
+    @app.errorhandler(RequestEntityTooLarge)
+    def handle_request_entity_too_large(error):
+        """
+        APIFlask's json_errors would answer browsers with a bare JSON blob;
+        registering on the concrete exception beats that catch-all.
+        (GSA/data.gov#6067)
+        """
+        logger.warning(
+            "Rejected request over the %sMB limit path=%s", MAX_UPLOAD_MB, request.path
+        )
+        message = f"Submission too large - must be {MAX_UPLOAD_MB}MB or less."
+
+        if request.path.startswith("/api/"):
+            return jsonify({"error": message}), 413
+
+        return render_template("413.html", message=message), 413
 
     global htmx
     htmx = HTMX(app)
@@ -316,16 +362,14 @@ def create_app():
     add_template_filters(app)
     register_cli(app)
 
-    with app.app_context():
-        # SQL-Alchemy can't be used to create the schema here
-        # Instead, `flask db upgrade` must already have been run
-        # db.create_all()
-        try:
-            load_manager.start()
-        except Exception as e:
-            # we need to get to app start up, so ignore all errors
-            # from the load manager but log them
-            logger.warning("Load manager startup failed with exception: %s", repr(e))
+    # emit new relic custom event for db idle-in-transaction monitoring
+    new_relic_monitor_db_activity = (
+        os.getenv("NEW_RELIC_MONITOR_DB_ACTIVITY", "false").lower() == "true"
+    )
+    if new_relic_monitor_db_activity:
+        from scripts.new_relic_db_monitor import emit_idle_transaction_event
+
+        emit_idle_transaction_event()
 
     # Content-Security-Policy headers
     # single quotes need to appear in some of the strings
@@ -384,11 +428,8 @@ def create_app():
         app,
         content_security_policy=csp,
         content_security_policy_nonce_in=["script-src", "style-src-elem"],
-        strict_transport_security_max_age=HSTS_MAX_AGE_SECONDS,
-        strict_transport_security_preload=True,
-        # our https connections are terminated outside this app
-        force_https=False,
         session_cookie_secure=is_running_on_cloud_foundry(),
+        **TALISMAN_BASELINE_OPTIONS,
     )
 
     return app
@@ -397,6 +438,13 @@ def create_app():
 def add_template_filters(app):
     from app.static_assets import static_url
 
-    for fn in [usa_icon, else_na, utc_isoformat, humanize]:
+    for fn in [
+        usa_icon,
+        else_na,
+        utc_isoformat,
+        humanize,
+        elapsed_time,
+        running_elapsed_time,
+    ]:
         app.add_template_filter(fn)
     app.add_template_global(static_url, "static_url")

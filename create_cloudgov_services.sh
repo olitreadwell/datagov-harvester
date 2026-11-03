@@ -18,6 +18,13 @@ cf service "${app_name}-smtp"  > /dev/null 2>&1 || cf create-service --wait aws-
 # create the secrets service if necessary
 cf service "${app_name}-secrets"  > /dev/null 2>&1 || cf cups "${app_name}-secrets"
 
+# create a validator-scoped secrets service if necessary. datagov-harvest-validator
+# binds this instead of ${app_name}-secrets so the public validator (it takes
+# server-side URL-fetch requests) never holds the admin app's secrets
+# (GSA/data.gov#6293). It needs only NEW_RELIC_LICENSE_KEY; `cf cups` with no
+# `-p` creates it empty, see docs/developer.md.
+cf service "${app_name}-validator-secrets"  > /dev/null 2>&1 || cf cups "${app_name}-validator-secrets"
+
 # create the OpenSearch service if necessary
 opensearch_plan=$(opensearch_plan_for_space "$space")
 if [ -n "$opensearch_plan" ]; then

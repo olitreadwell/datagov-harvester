@@ -1,6 +1,7 @@
 {% extends 'base.html' %}
 
 {% import 'components/job-table/job_table.j2' as job_table %}
+{% import 'components/confirm_button.j2' as confirm_button %}
 
 {% block script_head %}
 <script src="{{ static_url('assets/chartjs/chart.umd.js') }}"></script>
@@ -28,8 +29,6 @@
     <div class="display-flex flex-align-center flex-wrap">
         <h1 class="margin-right-2">{{data.source.name}}</h1>
     </div>
-
-
     <h2>Configuration</h2>
     <div class="config-table harvest-source-config-properties">
         <table class="usa-table usa-table--borderless width-full">
@@ -45,11 +44,19 @@
                 <td>Notification emails</td>
                 <td class="word-break-all">{{ value | join(', ') if value else 'N/A' }}</td>
                 {% endif %}
+                {% elif key == 'date_next_run' %}
+                <td>{{ key | humanize }}</td>
+                <td class="utc-date" data-utc-date="{{ value | utc_isoformat }}">
+                    {{ value | else_na }}
+                </td>
                 {% elif key == 'url' %}
                 <td>{{ key | humanize }}</td>
                 <td class="word-break-all">
                     <a href="{{value}}" target="_blank">{{value}}</a> {{ 'launch' | usa_icon | safe }}
                 </td>
+                {% elif key == 'description' %}
+                <td>{{ key | humanize }}</td>
+                <td>{{ value | else_na }}</td>
                 {% elif key == 'collection_parent_url' %}
                 {% if value %}
                 <td>{{ key | humanize }}</td>
@@ -57,6 +64,9 @@
                     <a href="{{value}}" target="_blank">{{value}}</a> {{ 'launch' | usa_icon | safe }}
                 </td>
                 {% endif %}
+                {% elif key == 'send_report_email' %}
+                <td>Send harvest report</td>
+                <td>{{value}}</td>
                 {% else %}
                 <td>{{ key | humanize }}</td>
                 <td class="word-break-all">{{value}}</td>
@@ -74,19 +84,26 @@
                     {{form.edit(class_='usa-button')}}
                 </li>
                 <li class="usa-button-group__item">
-                    {{form.harvest(class_='usa-button usa-button--outline')}}
+                    {{form.harvest(class_='usa-button usa-button--outline', disabled=data.source.is_locked)}}
                 </li>
                 <li class="usa-button-group__item">
-                    {{form.clear(class_='usa-button usa-button--outline confirm-submit', data_action="clear")}}
+                    {% if data.source.is_locked %}
+                    {{ confirm_button.render(form.unlock, 'usa-button--outline', 'unlock') }}
+                    {% else %}
+                    {{ confirm_button.render(form.lock, 'usa-button--outline', 'lock') }}
+                    {% endif %}
                 </li>
                 <li class="usa-button-group__item">
-                    {{form.delete(class_='usa-button usa-button--secondary confirm-submit', data_action="delete")}}
+                    {{ confirm_button.render(form.clear, 'usa-button--outline', 'clear') }}
+                </li>
+                <li class="usa-button-group__item">
+                    {{ confirm_button.render(form.delete, 'usa-button--secondary', 'delete') }}
 
                 </li>
             </ul>
             <fieldset class="usa-fieldset margin-top-2">
                 <div class="usa-checkbox">
-                    {{form.force_check(class_='usa-checkbox__input')}}
+                    {{form.force_check(class_='usa-checkbox__input', disabled=data.source.is_locked)}}
                     {{form.force_check.label(class_='usa-checkbox__label')}}
                 </div>
             </fieldset>
@@ -110,9 +127,15 @@
                 <td>{{data.summary_data["records_count"]}}</td>
             </tr>
             <tr>
-                <td>Last job errors and warnings</td>
+                <td>Outstanding record issues</td>
                 <td>
+                    {% if data.summary_data["last_job_errors"] %}
+                    <a href="{{ url_for('main.view_harvest_source_warnings', source_id=data.source.id) }}">
+                        {{data.summary_data["last_job_errors"]}}
+                    </a>
+                    {% else %}
                     {{data.summary_data["last_job_errors"] | else_na }}
+                    {% endif %}
                 </td>
             </tr>
             <tr>
@@ -138,7 +161,15 @@
             </div>
         </div>
         {% else %}
-        <canvas id="datagov-line-chart" height="200"></canvas>
+        <p class="text-base-dark">
+            "Warned" shows warning detections during each job. Records unchanged since a previous harvest are skipped;
+            changed or force-harvested records are checked again. See
+            <a href="{{ url_for('main.view_harvest_source_warnings', source_id=data.source.id) }}">Outstanding record issues</a>
+            for errors and warnings still open.
+        </p>
+        <div class="harvest-job-chart">
+            <canvas id="datagov-line-chart"></canvas>
+        </div>
         {% block htmx_paginated %}
         <div id="paginated__harvest-jobs">
             <!-- job_table is undefined on pagination so importing here -->
@@ -169,6 +200,9 @@
                             <th scope="col">ID</th>
                             <th scope="col">Type</th>
                             <th scope="col">Slug</th>
+                            {% if data.catalog_base_url %}
+                            <th scope="col">Catalog</th>
+                            {% endif %}
                         </tr>
                     </thead>
                     <tbody>
@@ -181,6 +215,13 @@
                                     {{ dataset.slug }}
                                 </a>
                             </td>
+                            {% if data.catalog_base_url %}
+                            <td>
+                                <a href="{{ data.catalog_base_url }}/dataset/{{ dataset.slug }}">
+                                    catalog
+                                </a>
+                            </td>
+                            {% endif %}
                         </tr>
                         {% endfor %}
                     </tbody>

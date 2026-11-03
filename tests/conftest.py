@@ -167,6 +167,22 @@ def dcatus_bad_license_uri_json():
         return file.read()
 
 
+@pytest.fixture
+def dcatus_no_identifier_json():
+    file = Path(__file__).parents[1] / "example_data/dcatus/dcatus_no_identifier.json"
+    with open(file, "r") as file:
+        return file.read()
+
+
+@pytest.fixture
+def dcatus_multiple_invalid_json():
+    file = (
+        Path(__file__).parents[1] / "example_data/dcatus/dcatus_multiple_invalid.json"
+    )
+    with open(file, "r") as file:
+        return file.read()
+
+
 ## ORGS
 @pytest.fixture
 def organization_data(fixtures_json) -> dict:
@@ -271,6 +287,21 @@ def source_data_dcatus3_0_no_identifier(organization_data: dict) -> dict:
 
 
 @pytest.fixture
+def source_data_dcatus3_0_warning(organization_data: dict) -> dict:
+    return {
+        "id": "c4d5e6f7-a8b9-4c0d-8e1f-2a3b4c5d6e7f",
+        "name": "Test Source DCAT-US 3.0 (warnings)",
+        "notification_emails": ["email@example.com"],
+        "organization_id": organization_data["id"],
+        "frequency": "daily",
+        "url": f"{HARVEST_SOURCE_URL}/dcatus/dcatus3_0_warning.json",
+        "schema_type": "dcatus3.0",
+        "source_type": "document",
+        "notification_frequency": "always",
+    }
+
+
+@pytest.fixture
 def source_data_dcatus3_0_with_services(organization_data: dict) -> dict:
     return {
         "id": "a2c4e6f8-1234-4567-89ab-cdef01234567",
@@ -361,6 +392,21 @@ def source_data_dcatus3_0_series_with_members(organization_data: dict) -> dict:
 
 
 @pytest.fixture
+def source_data_dcatus3_0_series_no_id(organization_data: dict) -> dict:
+    return {
+        "id": "a1c2e4f6-8901-4cde-f012-345678901236",
+        "name": "Test Source DCAT-US 3.0 (series no @id)",
+        "notification_emails": ["email@example.com"],
+        "organization_id": organization_data["id"],
+        "frequency": "daily",
+        "url": f"{HARVEST_SOURCE_URL}/dcatus/dcatus3_0_series_no_id.json",
+        "schema_type": "dcatus3.0",
+        "source_type": "document",
+        "notification_frequency": "always",
+    }
+
+
+@pytest.fixture
 def source_data_dcatus3_0_series_member_also_top_level(organization_data: dict) -> dict:
     return {
         "id": "f0b1c3d5-7890-4bcd-ef01-234567890199",
@@ -373,6 +419,36 @@ def source_data_dcatus3_0_series_member_also_top_level(organization_data: dict) 
             "dcatus3_0_series_member_also_top_level.json"
         ),
         "schema_type": "dcatus3.0",
+        "source_type": "document",
+        "notification_frequency": "always",
+    }
+
+
+@pytest.fixture
+def source_data_dcatus3_0_with_spatial_temporal(organization_data: dict) -> dict:
+    return {
+        "id": "9e88e994-49c4-4462-86ce-9c453d947818",
+        "name": "Test Source DCAT-US 3.0 (spatial and temporal)",
+        "notification_emails": ["email@example.com"],
+        "organization_id": organization_data["id"],
+        "frequency": "daily",
+        "url": f"{HARVEST_SOURCE_URL}/dcatus/dcatus3_0_with_spatial_temporal.json",
+        "schema_type": "dcatus3.0",
+        "source_type": "document",
+        "notification_frequency": "always",
+    }
+
+
+@pytest.fixture
+def source_data_dcatus1_1_ispartof(organization_data: dict) -> dict:
+    return {
+        "id": "f0b1c3d5-7890-4bcd-ef01-234567890198",
+        "name": "Test Source DCAT-US 1.1 (isPartOf)",
+        "notification_emails": ["email@example.com"],
+        "organization_id": organization_data["id"],
+        "frequency": "daily",
+        "url": f"{HARVEST_SOURCE_URL}/dcatus/dcatus1_1_ispartof.json",
+        "schema_type": "dcatus1.1: federal",
         "source_type": "document",
         "notification_frequency": "always",
     }
@@ -417,6 +493,21 @@ def source_data_dcatus_cant_translate_spatial(organization_data: dict) -> dict:
         "organization_id": organization_data["id"],
         "frequency": "daily",
         "url": f"{HARVEST_SOURCE_URL}/dcatus/dcatus_spatial_no_translate.json",
+        "schema_type": "dcatus1.1: federal",
+        "source_type": "document",
+        "notification_frequency": "always",
+    }
+
+
+@pytest.fixture
+def source_data_dcatus_wkt_spatial(organization_data: dict) -> dict:
+    return {
+        "id": "1e875791-ec30-4e54-9d15-9f8ef9e93dd7",
+        "name": "Test Source (wkt spatial)",
+        "notification_emails": ["email@example.com"],
+        "organization_id": organization_data["id"],
+        "frequency": "daily",
+        "url": f"{HARVEST_SOURCE_URL}/dcatus/dcatus_spatial_wkt.json",
         "schema_type": "dcatus1.1: federal",
         "source_type": "document",
         "notification_frequency": "always",
@@ -688,6 +779,15 @@ def job_data_dcatus3_0_no_identifier(source_data_dcatus3_0_no_identifier: dict) 
 
 
 @pytest.fixture
+def job_data_dcatus3_0_warning(source_data_dcatus3_0_warning: dict) -> dict:
+    return {
+        "id": "e5f6a7b8-c9d0-4e1f-8a2b-3c4d5e6f7a8b",
+        "status": "new",
+        "harvest_source_id": source_data_dcatus3_0_warning["id"],
+    }
+
+
+@pytest.fixture
 def job_data_dcatus3_0_with_services(
     source_data_dcatus3_0_with_services: dict,
 ) -> dict:
@@ -754,6 +854,17 @@ def job_data_dcatus3_0_series_with_members(
 
 
 @pytest.fixture
+def job_data_dcatus3_0_series_no_id(
+    source_data_dcatus3_0_series_no_id: dict,
+) -> dict:
+    return {
+        "id": "b2d3f5a7-9012-4def-0123-456789012347",
+        "status": "new",
+        "harvest_source_id": source_data_dcatus3_0_series_no_id["id"],
+    }
+
+
+@pytest.fixture
 def job_data_dcatus3_0_series_member_also_top_level(
     source_data_dcatus3_0_series_member_also_top_level: dict,
 ) -> dict:
@@ -761,6 +872,17 @@ def job_data_dcatus3_0_series_member_also_top_level(
         "id": "a1c2e4f6-8901-4cde-f012-345678901299",
         "status": "new",
         "harvest_source_id": (source_data_dcatus3_0_series_member_also_top_level["id"]),
+    }
+
+
+@pytest.fixture
+def job_data_dcatus3_0_with_spatial_temporal(
+    source_data_dcatus3_0_with_spatial_temporal: dict,
+) -> dict:
+    return {
+        "id": "0fc09b6e-2e0e-4adb-a5ec-f728da229b0d",
+        "status": "new",
+        "harvest_source_id": source_data_dcatus3_0_with_spatial_temporal["id"],
     }
 
 
@@ -1395,30 +1517,6 @@ def invalid_envelope_geojson():
 
 
 @pytest.fixture
-def mock_requests_get_ms_iis_waf(monkeypatch):
-    """Fixture to mock requests.get with ms-iis-waf HTML content"""
-    import requests
-
-    def mock_get(url, *args, **kwargs):
-        """Mock function to return a predefined HTML response"""
-        mock_response = Mock()
-        mock_response.status_code = 200
-
-        # Read mock HTML content from file
-        file_path = Path(__file__).parent / "waf-html-examples/ms-iis-waf.html"
-        with open(file_path, "r", encoding="utf-8") as file:
-            mock_response.text = file.read()
-
-        # Set UTF-8 content
-        mock_response.content = mock_response.text.encode("utf-8")
-
-        return mock_response
-
-    # Apply the patch using monkeypatch
-    monkeypatch.setattr(requests, "get", mock_get)
-
-
-@pytest.fixture
 def dcatus_keywords():
     return [
         "EARTH         SCIENCE > BIOSPHERE > ECOSYSTEMS > MARINE ECOSYSTEMS > COASTAL",
@@ -1678,6 +1776,7 @@ def sample_dataset():
             "title": "Dataset Title",
             "description": "Dataset description",
             "publisher": {"name": "Publisher"},
+            "accessLevel": "public",
             "keyword": ["kw-1"],
             "theme": ["theme-1"],
             "identifier": "id-1",
@@ -1695,7 +1794,9 @@ def sample_dataset():
         organization=DummyOrg(),
         popularity=7,
         harvest_record_id="hr-1",
-        harvest_record=SimpleNamespace(source_transform={"title": "Transformed"}),
+        harvest_record=SimpleNamespace(
+            source_transform={"title": "Transformed"}, parent_identifier="parent-1"
+        ),
     )
 
 

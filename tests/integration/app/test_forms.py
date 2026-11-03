@@ -27,6 +27,24 @@ class TestForms:
         assert org.description == "A sample description"
         assert org.slug == "test-slug"
 
+    def test_add_organization_without_logo_is_allowed(self, app, client, interface):
+        app.config.update({"WTF_CSRF_ENABLED": False})
+        with client.session_transaction() as sess:
+            sess["user"] = "tester@gsa.gov"
+
+        data = {
+            "name": "No Logo Org",
+            "logo": "",
+            "description": "An org with no logo provided",
+            "slug": "no-logo-org",
+        }
+        res = client.post("/organization/add", data=data)
+
+        assert res.status_code == 302
+        orgs = interface.get_all_organizations()
+        org = orgs[0]
+        assert org.logo is None
+
     def test_add_organization_aliases(self, app, client, interface):
         app.config.update({"WTF_CSRF_ENABLED": False})
         with client.session_transaction() as sess:
@@ -71,12 +89,9 @@ class TestForms:
 
         res = client.post("/organization/add", data=data, follow_redirects=False)
 
-        assert res.status_code == 302
-
-        follow = client.get(res.headers["Location"], follow_redirects=True)
-        assert follow.status_code == 200
-        print(follow.data.decode())
-        assert b"Slug must be unique." in follow.data
+        # Form should re-render with validation error (not redirect)
+        assert res.status_code == 200
+        assert b"Slug must be unique." in res.data
 
         orgs = interface.get_all_organizations()
         assert len(orgs) == 1
@@ -113,6 +128,107 @@ class TestForms:
             "user@example.com",
             "other@example.com",
         ]
+
+    def test_add_harvest_source_redirects_to_new_source(
+        self, app, client, interface, organization_data
+    ):
+        app.config.update({"WTF_CSRF_ENABLED": False})
+        with client.session_transaction() as sess:
+            sess["user"] = "tester@gsa.gov"
+
+        interface.add_organization(organization_data)
+
+        form_data = {
+            "organization_id": organization_data["id"],
+            "name": "Redirect Source",
+            "url": "https://example.com/redirect/data.json",
+            "notification_emails": "user@example.com",
+            "frequency": "daily",
+            "schema_type": "dcatus1.1: federal",
+            "source_type": "document",
+            "notification_frequency": "always",
+        }
+        res = client.post("/harvest_source/add", data=form_data)
+
+        assert res.status_code == 302
+        sources = interface.get_all_harvest_sources()
+        assert len(sources) == 1
+        assert res.headers["Location"] == f"/harvest_source/{sources[0].id}"
+
+        follow = client.get(res.headers["Location"])
+        assert follow.status_code == 200
+        assert b"Redirect Source" in follow.data
+        assert b"Added new harvest source with ID:" in follow.data
+
+    def test_add_harvest_source_add_another_returns_to_form(
+        self, app, client, interface, organization_data
+    ):
+        app.config.update({"WTF_CSRF_ENABLED": False})
+        with client.session_transaction() as sess:
+            sess["user"] = "tester@gsa.gov"
+
+        interface.add_organization(organization_data)
+
+        form_data = {
+            "organization_id": organization_data["id"],
+            "name": "First Of Many",
+            "url": "https://example.com/first/data.json",
+            "notification_emails": "user@example.com",
+            "frequency": "daily",
+            "schema_type": "dcatus1.1: federal",
+            "source_type": "document",
+            "notification_frequency": "always",
+            "add_another": "1",
+        }
+        res = client.post("/harvest_source/add", data=form_data)
+
+        assert res.status_code == 302
+        assert res.headers["Location"] == (
+            f"/harvest_source/add?organization_id={organization_data['id']}"
+        )
+        assert len(interface.get_all_harvest_sources()) == 1
+
+        follow = client.get(res.headers["Location"])
+        assert follow.status_code == 200
+        assert b"Added new harvest source with ID:" in follow.data
+        soup = BeautifulSoup(follow.data, "html.parser")
+        selected = soup.select_one("select#organization_id option[selected]")
+        assert selected["value"] == organization_data["id"]
+        assert soup.select_one("input#name")["value"] == ""
+
+    def test_add_harvest_source_ignores_unknown_organization_param(
+        self, app, client, interface, organization_data
+    ):
+        with client.session_transaction() as sess:
+            sess["user"] = "tester@gsa.gov"
+
+        interface.add_organization(organization_data)
+
+        res = client.get("/harvest_source/add?organization_id=not-a-real-org")
+
+        assert res.status_code == 200
+        soup = BeautifulSoup(res.data, "html.parser")
+        assert soup.select_one("select#organization_id option[selected]") is None
+
+    def test_add_another_button_only_on_add_harvest_source(
+        self, client, interface, organization_data, source_data_dcatus
+    ):
+        with client.session_transaction() as sess:
+            sess["user"] = "tester@gsa.gov"
+
+        interface.add_organization(organization_data)
+        interface.add_harvest_source(source_data_dcatus)
+
+        add_page = client.get("/harvest_source/add")
+        assert b'name="add_another"' in add_page.data
+
+        edit_page = client.get(f"/harvest_source/edit/{source_data_dcatus['id']}")
+        assert edit_page.status_code == 200
+        assert b'name="add_another"' not in edit_page.data
+
+        org_page = client.get("/organization/add")
+        assert org_page.status_code == 200
+        assert b'name="add_another"' not in org_page.data
 
     def test_add_harvest_source_source_type_options_match_enum(
         self, app, client, interface, organization_data
@@ -192,6 +308,82 @@ class TestForms:
         source = interface.get_harvest_source(source_data_waf_collection["id"])
         assert source.source_type == "document"
         assert source.collection_parent_url is None
+
+    def test_edit_harvest_source_duplicate_url_shows_friendly_error(
+        self,
+        app,
+        client,
+        interface,
+        organization_data,
+        source_data_dcatus,
+        source_data_dcatus_2,
+    ):
+        app.config.update({"WTF_CSRF_ENABLED": False})
+        with client.session_transaction() as sess:
+            sess["user"] = "tester@gsa.gov"
+
+        interface.add_organization(organization_data)
+        interface.add_harvest_source(source_data_dcatus)
+        interface.add_harvest_source(source_data_dcatus_2)
+
+        form_data = {
+            "organization_id": organization_data["id"],
+            "name": source_data_dcatus_2["name"],
+            "url": source_data_dcatus["url"],
+            "notification_emails": "user@example.com",
+            "frequency": "daily",
+            "schema_type": "dcatus1.1: federal",
+            "source_type": "document",
+            "notification_frequency": "always",
+        }
+        res = client.post(
+            f"/harvest_source/edit/{source_data_dcatus_2['id']}",
+            data=form_data,
+            follow_redirects=True,
+        )
+
+        assert res.status_code == 200
+        assert b"already exists" in res.data
+
+    def test_edit_harvest_source_keeping_same_url_does_not_flag_itself(
+        self,
+        app,
+        client,
+        interface,
+        organization_data,
+        source_data_dcatus,
+        source_data_dcatus_2,
+    ):
+        """Editing a source without changing its URL must never flag it as a
+        duplicate of itself, even though a different source also exists."""
+        app.config.update({"WTF_CSRF_ENABLED": False})
+        with client.session_transaction() as sess:
+            sess["user"] = "tester@gsa.gov"
+
+        interface.add_organization(organization_data)
+        interface.add_harvest_source(source_data_dcatus)
+        interface.add_harvest_source(source_data_dcatus_2)
+
+        form_data = {
+            "organization_id": organization_data["id"],
+            "name": "Renamed Source",
+            "url": source_data_dcatus["url"],
+            "notification_emails": "user@example.com",
+            "frequency": "daily",
+            "schema_type": "dcatus1.1: federal",
+            "source_type": "document",
+            "notification_frequency": "always",
+        }
+        res = client.post(
+            f"/harvest_source/edit/{source_data_dcatus['id']}",
+            data=form_data,
+            follow_redirects=True,
+        )
+
+        assert res.status_code == 200
+        assert b"already exists" not in res.data
+        source = interface.get_harvest_source(source_data_dcatus["id"])
+        assert source.name == "Renamed Source"
 
     def test_add_harvest_source_waf_collection(
         self, app, client, interface, organization_data
@@ -369,6 +561,25 @@ class TestForms:
 
         option_labels = [opt.text.split(" - ")[0] for opt in select.find_all("option")]
         assert option_labels == sorted(option_labels, key=str.lower)
+
+    def test_add_harvest_source_preselects_organization_from_query_string(
+        self, client, interface, organization_data
+    ):
+        with client.session_transaction() as sess:
+            sess["user"] = "tester@gsa.gov"
+
+        interface.add_organization(organization_data)
+
+        res = client.get(
+            "/harvest_source/add",
+            query_string={"organization_id": organization_data["id"]},
+        )
+
+        assert res.status_code == 200
+        soup = BeautifulSoup(res.data, "html.parser")
+        selected = soup.select_one("select#organization_id option[selected]")
+        assert selected is not None
+        assert selected["value"] == organization_data["id"]
 
 
 @pytest.mark.usefixtures("mock_opensearch")

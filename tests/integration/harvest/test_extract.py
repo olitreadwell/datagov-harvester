@@ -1,12 +1,89 @@
+from datetime import datetime
+from pathlib import Path
+from unittest.mock import Mock
+from urllib.parse import urljoin
+
+import pytest
+
 from harvester.harvest import DT_PLACEHOLDER
-from harvester.utils.general_utils import traverse_waf
+from harvester.utils.general_utils import RESOLVED_IDENTIFIER_KEY, traverse_waf
+
+WAF_HTML_EXAMPLES = Path(__file__).parents[2] / "waf-html-examples"
 
 
 class TestExtract:
-    def test_traverse_waf_ms_iis(self, mock_requests_get_ms_iis_waf):
-        """Test to ensure that we're able to traverse the ms-iis-waf"""
-        files = traverse_waf(url="https://example.com")
-        assert len(files) == 2
+    @pytest.mark.parametrize(
+        "fixture_name, source_url, expected_entries",
+        [
+            pytest.param(
+                "apache-noaa-waf.html",
+                "https://data.noaa.gov/waf/NOAA/nmfs/garfo/iso/xml/",
+                [
+                    ("1463.xml", datetime(2026, 7, 12, 2, 23)),
+                    ("1503.xml", datetime(2026, 7, 12, 2, 23)),
+                ],
+                id="apache",
+            ),
+            pytest.param(
+                "nginx-dggs-waf.html",
+                "https://dggs.alaska.gov/webpubs/metadata/",
+                [
+                    ("AOF125.xml", datetime(2025, 10, 2, 11, 47)),
+                    ("AOF134.xml", datetime(2026, 7, 30, 16, 1)),
+                ],
+                id="nginx-mixed-file-types",
+            ),
+            pytest.param(
+                "ms-iis-waf.html",
+                "https://edg.epa.gov/WAFer_harvest/ISO/",
+                [
+                    (
+                        "/WAFer_harvest/ISO/enviroatlas-metadata-waf_"
+                        "ACS_Demographics_by_Tract_2008_2012_EA.xml",
+                        datetime(2021, 6, 17, 12, 20),
+                    ),
+                    (
+                        "/WAFer_harvest/ISO/"
+                        "enviroatlas-metadata-waf_Ag_On_Slopes.xml",
+                        datetime(2025, 7, 23, 17, 33),
+                    ),
+                ],
+                id="microsoft-iis",
+            ),
+            pytest.param(
+                "bts-waf.html",
+                "https://transtats.bts.gov/NTADmetadata/",
+                [
+                    (
+                        "/NTADmetadata/"
+                        "USDOT_BTS_NTAD_119th_Congressional_Districts.xml",
+                        datetime(2026, 7, 31, 16, 53),
+                    ),
+                    (
+                        "/NTADmetadata/USDOT_BTS_NTAD_1991_FAP.xml",
+                        datetime(2026, 7, 15, 16, 23),
+                    ),
+                ],
+                id="iis-long-date",
+            ),
+        ],
+    )
+    def test_traverse_waf_server_indexes(
+        self, monkeypatch, fixture_name, source_url, expected_entries
+    ):
+        response = Mock(
+            ok=True,
+            content=(WAF_HTML_EXAMPLES / fixture_name).read_bytes(),
+        )
+        requests_get = Mock(return_value=response)
+        monkeypatch.setattr("harvester.utils.general_utils.requests.get", requests_get)
+
+        files = traverse_waf(url=source_url)
+
+        assert [(file["identifier"], file["modified_date"]) for file in files] == [
+            (urljoin(source_url, href), modified_date)
+            for href, modified_date in expected_entries
+        ]
 
     def test_extract_dcatus(
         self,
@@ -29,6 +106,32 @@ class TestExtract:
         harvest_source.acquire_minimum_external_data()
 
         assert len(harvest_source.external_records) == 4
+
+    def test_extract_dcatus3_0_with_spatial_temporal(
+        self,
+        make_harvest_source,
+        source_data_dcatus3_0_with_spatial_temporal,
+        job_data_dcatus3_0_with_spatial_temporal,
+    ):
+        harvest_source = make_harvest_source(
+            source_data_dcatus3_0_with_spatial_temporal,
+            job_data_dcatus3_0_with_spatial_temporal,
+        )
+        harvest_source.acquire_minimum_external_data()
+
+        assert len(harvest_source.external_records) == 1
+        record = harvest_source.external_records[0]
+        assert record["spatial"] == {
+            "@type": "Location",
+            "bbox": "POLYGON((-125 24, -66 24, -66 50, -125 50, -125 24))",
+        }
+        assert record["temporal"] == [
+            {
+                "@type": "PeriodOfTime",
+                "startDate": "2020-01-01",
+                "endDate": "2020-12-31",
+            }
+        ]
 
     def test_extract_dcatus3_0_nested_catalog(
         self,
@@ -111,6 +214,11 @@ class TestExtract:
         source_data_dcatus3_0_service_no_identifier,
         job_data_dcatus3_0_service_no_identifier,
     ):
+        """A DataService's identifier is optional per the DCAT-US3.0 schema.
+        A missing identifier gets a resolved bookkeeping identifier instead
+        of being dropped as an error, but the record itself (what gets
+        validated/persisted) is left exactly as the provider sent it --
+        see GSA/data.gov#6431."""
         harvest_source = make_harvest_source(
             source_data_dcatus3_0_service_no_identifier,
             job_data_dcatus3_0_service_no_identifier,
@@ -120,14 +228,44 @@ class TestExtract:
 
         # the dataset is unaffected by the service's missing identifier
         assert len(harvest_source.external_records) == 1
-        assert len(harvest_source.external_records_by_type["data_service"]) == 0
+        assert len(harvest_source.external_records_by_type["data_service"]) == 1
+
+        record = harvest_source.external_records_by_type["data_service"][0]
+        assert record[RESOLVED_IDENTIFIER_KEY] == "data-service-without-identifier"
+        assert "identifier" not in record
 
         errors = interface.get_harvest_record_errors_by_job(harvest_source.job_id)
-        msg = (
-            "Test Source DCAT-US 3.0 (service no identifier) "
-            "Data Service Without Identifier is missing 'identifier' field"
+        assert errors == []
+
+    def test_extract_dcatus3_0_series_missing_id(
+        self,
+        interface,
+        make_harvest_source,
+        source_data_dcatus3_0_series_no_id,
+        job_data_dcatus3_0_series_no_id,
+    ):
+        """A DatasetSeries's @id is optional per the DCAT-US3.0 schema. A
+        missing @id gets a resolved bookkeeping identifier instead of being
+        dropped as an error, but the record itself (what gets
+        validated/persisted) is left exactly as the provider sent it --
+        see GSA/data.gov#6431."""
+        harvest_source = make_harvest_source(
+            source_data_dcatus3_0_series_no_id,
+            job_data_dcatus3_0_series_no_id,
         )
-        assert errors[0][0].message == msg
+        harvest_source.acquire_data_sources()
+        harvest_source.filter_datasets_with_no_identifier()
+
+        # the dataset is unaffected by the series' missing @id
+        assert len(harvest_source.external_records) == 1
+        assert len(harvest_source.external_records_by_type["data_series"]) == 1
+
+        record = harvest_source.external_records_by_type["data_series"][0]
+        assert record[RESOLVED_IDENTIFIER_KEY] == "dataset-series-without-an-id"
+        assert "@id" not in record
+
+        errors = interface.get_harvest_record_errors_by_job(harvest_source.job_id)
+        assert errors == []
 
     def test_extract_dcatus3_0_with_records(
         self,

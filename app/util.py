@@ -1,27 +1,3 @@
-import ipaddress
-import json
-import logging
-import os
-import socket
-from pathlib import Path
-from urllib.parse import urlparse
-
-import requests
-from jsonschema import Draft202012Validator, FormatChecker
-
-from harvester.utils.general_utils import (
-    USER_AGENT,
-    assemble_validation_errors,
-    build_dcatus3_validator,
-    open_json,
-)
-
-logger = logging.getLogger("harvest_admin_utils")
-
-BASE_DIR = Path(__file__).parents[1]
-IS_PROD = os.getenv("FLASK_ENV") == "production"
-
-
 # Helper Functions
 def make_new_source_contract(form):
     collection_parent_url = None
@@ -38,6 +14,7 @@ def make_new_source_contract(form):
         "source_type": form.source_type.data,
         "collection_parent_url": collection_parent_url,
         "notification_frequency": form.notification_frequency.data,
+        "send_report_email": form.send_report_email.data == "True",
     }
 
 
@@ -66,139 +43,20 @@ def make_new_record_error_contract(error: tuple) -> dict:
 
 
 def make_new_org_contract(form):
+    # Convert empty string to None for code_repo_url
+    code_repo_url = form.code_repo_url.data
+    if code_repo_url:
+        code_repo_url = code_repo_url.strip() or None
+    else:
+        code_repo_url = None
+
     return {
         "name": form.name.data,
         "slug": form.slug.data,
-        "logo": form.logo.data,
+        "logo": form.logo.data or None,
         "description": form.description.data or None,
         "organization_type": form.organization_type.data or None,
         "aliases": [alias.strip() for alias in (form.aliases.data or "").split(",")],
+        "code_repo_url": code_repo_url,
+        "code_repo_exempt": form.code_repo_exempt.data or False,
     }
-
-
-def is_public_ip(hostname: str) -> bool:
-    """
-    Resolve hostname and ensure all IPs are public.
-    Prevents access to:
-    - localhost
-    - 127.0.0.1
-    - 10.x.x.x
-    - 192.168.x.x
-    - 172.16-31.x.x
-    - link-local
-    - metadata services
-    """
-    try:
-        addresses = socket.getaddrinfo(hostname, None)
-        for addr in addresses:
-            ip = addr[4][0]
-            ip_obj = ipaddress.ip_address(ip)
-
-            if (
-                ip_obj.is_private
-                or ip_obj.is_loopback
-                or ip_obj.is_reserved
-                or ip_obj.is_link_local
-                or ip_obj.is_multicast
-            ):
-                return False
-        return True
-    except Exception:
-        return False
-
-
-def fetch_json_from_url(url: str) -> dict:
-
-    max_content_length = 10 * 1024 * 1024  # 10MB limit
-
-    parsed = urlparse(url)
-
-    if parsed.scheme not in ("http", "https"):
-        raise ValueError("Only HTTP/HTTPS URLs are allowed.")
-
-    if not parsed.hostname:
-        raise ValueError("Invalid URL.")
-
-    if not is_public_ip(parsed.hostname) and IS_PROD:
-        raise ValueError("Access to private/internal addresses is not allowed.")
-
-    try:
-        response = requests.get(
-            url,
-            headers={"User-Agent": USER_AGENT},
-            stream=True,
-        )
-        response.raise_for_status()
-    except Exception as e:
-        raise ValueError(f"Error processing request: {str(e)}")
-
-    content_length = response.headers.get("Content-Length")
-    if content_length and int(content_length) > max_content_length:
-        raise ValueError("JSON payload too large - must be 10MB or less.")
-
-    content_type = response.headers.get("Content-Type", "")
-    if "application/json" not in content_type:
-        raise ValueError("URL did not return JSON.")
-
-    chunks = []
-    total_size = 0
-
-    try:
-        for chunk in response.iter_content(chunk_size=8192):
-            if chunk:
-                total_size += len(chunk)
-                if total_size > max_content_length:
-                    raise ValueError("JSON payload too large - must be 10MB or less.")
-                chunks.append(chunk)
-    finally:
-        response.close()
-
-    content = b"".join(chunks)
-
-    if len(content) > max_content_length:
-        raise ValueError("JSON payload too large - must be 10MB or less.")
-
-    try:
-        return json.loads(content)
-    except json.JSONDecodeError as e:
-        raise ValueError(f"Invalid JSON: {str(e)}")
-
-
-def validate_records(dcatus_catalog: dict, schema_name: str) -> list:
-    """
-    validates records from the input dcatus catalog based on the provided schema_name
-    """
-
-    output = []
-
-    dcatus1_1_dir = BASE_DIR / "schemas" / "dcatus1.1"
-    dcatus3_0_dir = BASE_DIR / "schemas" / "dcatus3.0" / "definitions"
-
-    schemas = {
-        "dcatus1.1: federal dataset": dcatus1_1_dir / "federal_dataset.json",
-        "dcatus1.1: non-federal dataset": dcatus1_1_dir / "non-federal_dataset.json",
-        "dcatus3.0 catalog": dcatus3_0_dir,
-    }
-
-    schema = schemas[schema_name]
-
-    if schema_name.startswith("dcatus1.1"):
-        validator = Draft202012Validator(
-            open_json(schema), format_checker=FormatChecker()
-        )
-
-        for idx, record in enumerate(dcatus_catalog["dataset"]):
-            errors = validator.iter_errors(record)
-            errors = [e.message for e in assemble_validation_errors(errors)]
-            identifier = idx if "identifier" not in record else record["identifier"]
-            output += list(zip([identifier] * len(errors), errors))
-    else:
-        validator = build_dcatus3_validator(schema)
-        errors = validator.iter_errors(dcatus_catalog)
-        errors = [e.message for e in assemble_validation_errors(errors)]
-        # not going to pull the record identifier from the error message for now.
-        # the json path will clearly indicate which dataset is
-        # wrong (e.g. $.dataset[0] )
-        output += list(zip([""] * len(errors), errors))
-
-    return output

@@ -1,11 +1,8 @@
-import json
-import os
 from enum import Enum as PyEnum
 
 import marshmallow
 from apiflask import Schema, validators
 from apiflask.fields import (
-    URL,
     UUID,
     Boolean,
     DateTime,
@@ -13,6 +10,7 @@ from apiflask.fields import (
     Enum,
     Integer,
     List,
+    Raw,
     String,
 )
 from marshmallow import ValidationError, validate
@@ -25,10 +23,9 @@ from shared.constants import (
     ORGANIZATION_TYPE_VALUES,
     RECORD_STATUS_VALUES,
     SCHEMA_TYPE_VALUES,
+    SEVERITY_VALUES,
     SOURCE_TYPE_VALUES,
 )
-
-IS_PROD = os.getenv("FLASK_ENV") == "production"
 
 
 def _to_enum(name, values):
@@ -48,6 +45,7 @@ NOTIFICATION_FREQUENCY_ENUM = _to_enum(
 ORGANIZATION_TYPE_ENUM = _to_enum("OrganizationType", ORGANIZATION_TYPE_VALUES)
 RECORD_STATUS_ENUM = _to_enum("RecordStatus", RECORD_STATUS_VALUES)
 SCHEMA_TYPE_ENUM = _to_enum("SchemaType", SCHEMA_TYPE_VALUES)
+SEVERITY_ENUM = _to_enum("Severity", SEVERITY_VALUES)
 SOURCE_TYPE_ENUM = _to_enum("SourceType", SOURCE_TYPE_VALUES)
 
 
@@ -58,8 +56,9 @@ ErrorInfo = Schema.from_dict(
         "date_created": DateTime(),
         "type": String(),
         "message": String(),
+        "severity": Enum(SEVERITY_ENUM),
         "harvest_record_id": UUID(required=True),
-        "harvest_job_id": UUID(required=True),
+        "harvest_job_id": UUID(allow_none=True),
     },
     name="ErrorInfo",
 )
@@ -71,6 +70,7 @@ class JobInfo(Schema):
     status = Enum(JOB_STATUS_ENUM, required=True)
     job_type = String()
     date_created = DateTime()
+    date_started = DateTime()
     date_finished = DateTime()
     records_total = Integer()
     records_added = Integer()
@@ -79,6 +79,26 @@ class JobInfo(Schema):
     records_errored = Integer()
     records_ignored = Integer()
     records_validated = Integer()
+    records_warned = Integer()
+
+
+class JobCreate(Schema):
+    id = String()
+    harvest_source_id = String(required=True)
+    status = String(required=True, validate=validate.OneOf(JOB_STATUS_VALUES))
+    job_type = String()
+    date_created = DateTime()
+    date_started = DateTime()
+    date_finished = DateTime()
+    records_total = Integer()
+    records_added = Integer()
+    records_updated = Integer()
+    records_deleted = Integer()
+    records_errored = Integer()
+    records_warned = Integer()
+    records_ignored = Integer()
+    records_validated = Integer()
+    dcatus_catalog = Raw()
 
 
 class OrgCreate(Schema):
@@ -98,6 +118,31 @@ class OrgCreate(Schema):
     )
     organization_type = Enum(ORGANIZATION_TYPE_ENUM)
     aliases = List(String())
+    code_repo_url = String()
+    code_repo_exempt = Boolean()
+
+    @marshmallow.validates("code_repo_url")
+    def validate_code_repo_url(self, value, **kwargs):
+        """Validate that code_repo_url starts with http:// or https://."""
+        if value and value.strip():
+            if not (value.startswith("http://") or value.startswith("https://")):
+                raise ValidationError("URL must start with http:// or https://")
+
+    @marshmallow.post_load
+    def unwrap_organization_type(self, data, **kwargs):
+        """Return the organization type as the plain string.
+
+        The Enum field deserializes to the enum member, but
+        Organization.organization_type is declared with the values
+        themselves, so the member reaches the insert as
+        "OrganizationType.Non-Profit" and Postgres rejects it. _to_enum
+        builds these with the name and the value the same, so the value is
+        exactly what came in.
+        """
+        organization_type = data.get("organization_type")
+        if isinstance(organization_type, PyEnum):
+            data["organization_type"] = organization_type.value
+        return data
 
 
 class OrgInfo(OrgCreate):
@@ -105,16 +150,86 @@ class OrgInfo(OrgCreate):
     source_count = Integer()
 
 
-class QueryInfo(Schema):
-    """Query input for various object types."""
+class RecordIssueQuery(Schema):
+    """Query input for the per-record issue route.
+
+    Query schemas are inlined as OpenAPI `parameters` rather than added to
+    `components.schemas`, so this documents the filter without adding a
+    schema definition.
+    """
+
+    severity = Enum(SEVERITY_ENUM)
+
+
+class BaseQueryInfo(Schema):
+    """Base query parameters available to all collection endpoints."""
+
+    facets = String()
+    harvest_job_id = UUID()
+    harvest_source_id = UUID()
+    facets = String(
+        metadata={
+            "description": (
+                "Advanced filtering using facet syntax. "
+                "Format: 'field operator value' where operator is one of: "
+                "eq (equal), ne (not equal), gt (greater than), lt (less than), "
+                "like_op (SQL LIKE pattern matching). "
+                "Example: 'status eq complete' or 'date_created gt 2024-01-01'"
+            )
+        }
+    )
+    page = Integer()
+    per_page = Integer()
+    paginate = Boolean()
+    count = Boolean()
+    order_by = String()
+
+
+class OrganizationsQueryInfo(BaseQueryInfo):
+    """Query input for /organizations/ endpoint."""
+
+    pass
+
+
+class HarvestSourcesQueryInfo(BaseQueryInfo):
+    """Query input for /harvest_sources/ endpoint."""
+
+    organization_id = UUID()
+
+
+class HarvestJobsQueryInfo(BaseQueryInfo):
+    """Query input for /harvest_jobs/ endpoint."""
+
+    harvest_source_id = UUID()
+
+
+class HarvestRecordsQueryInfo(BaseQueryInfo):
+    """Query input for /harvest_records/ endpoint."""
+
+    harvest_source_id = UUID()
+    harvest_job_id = UUID()
+
+
+class HarvestJobErrorsQueryInfo(BaseQueryInfo):
+    """Query input for /harvest_job_errors/ endpoint."""
+
+    harvest_job_id = UUID()
+
+
+class HarvestRecordErrorsQueryInfo(BaseQueryInfo):
+    """Query input for /harvest_record_errors/ endpoint."""
+
+    harvest_job_id = UUID()
+    harvest_record_id = UUID()
+    severity = Enum(SEVERITY_ENUM)
+
+
+class QueryInfo(BaseQueryInfo):
+    """Legacy query input schema for backward compatibility."""
 
     harvest_job_id = UUID()
     harvest_source_id = UUID()
-    facets = String()
-    page = Integer()
-    per_page = Integer()
-    count = Boolean()
-    order_by = String()
+    severity = Enum(SEVERITY_ENUM)
 
 
 class RecordInfo(Schema):
@@ -143,60 +258,6 @@ class SourceInfo(Schema):
     schema_type = Enum(SCHEMA_TYPE_ENUM, required=True)
     source_type = Enum(SOURCE_TYPE_ENUM, required=True)
     notification_frequency = Enum(NOTIFICATION_FREQUENCY_ENUM, required=True)
+    is_locked = Boolean(required=True)
     collection_parent_url = String()
-
-
-class ValidatorInfo(Schema):
-    schema = String(
-        required=True,
-        validate=validators.OneOf(
-            [
-                "dcatus1.1: federal dataset",
-                "dcatus1.1: non-federal dataset",
-            ]
-        ),
-    )
-    fetch_method = String(
-        required=True,
-        validate=validators.OneOf(
-            [
-                "url",
-                "paste",
-            ]
-        ),
-    )
-    url = URL(require_tld=IS_PROD)
-
-    @marshmallow.validates_schema
-    def validate_url(self, data, **kwargs):
-        if data.get("fetch_method") == "url" and not data.get("url"):
-            raise ValidationError("'url' field is required when fetch_method is 'url'")
-
-    json_text = String()
-
-    @marshmallow.validates_schema
-    def validate_json_text(self, data, **kwargs):
-        if data.get("fetch_method") == "paste":
-            if not data.get("json_text"):
-                raise ValidationError(
-                    "'json_text' field is required when fetch_method is 'paste'"
-                )
-            else:
-                try:
-                    json.loads(data.get("json_text"))
-                except json.JSONDecodeError:
-                    raise ValidationError("Invalid JSON")
-
-
-class ValidationResultSchema(Schema):
-    validation_errors = List(
-        List(
-            String(),
-            validate=validate.Length(equal=2),
-        ),
-        required=True,
-    )
-
-
-class ValidationErrorResponseSchema(Schema):
-    error = String(required=True)
+    date_next_run = DateTime()

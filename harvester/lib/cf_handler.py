@@ -50,7 +50,7 @@ class CFHandler:
     def start_task(self, command, task_id):
         """Start a task on the currently running app's GUUID."""
         self.setup()
-        TASK_MEMORY = os.getenv("HARVEST_RUNNER_TASK_MEM", "1536")
+        TASK_MEMORY = os.getenv("HARVEST_RUNNER_TASK_MEM", "4096")
         TASK_DISK = os.getenv("HARVEST_RUNNER_TASK_DISK", "4096")
         return self.task_mgr.create(
             self._app_guuid(),
@@ -155,6 +155,8 @@ class CFHandler:
         if app_guuid is None:
             app_guuid = self._app_guuid()
         self.setup()
-        app = self.client.v2.apps[app_guuid]
-        logs = filter(lambda lg: task_id in lg, [str(log) for log in app.recent_logs()])
+        logs = filter(
+            lambda lg: task_id in lg,
+            [str(log) for log in self.client.doppler.recent_logs(app_guuid)],
+        )
         return "\n".join(logs)

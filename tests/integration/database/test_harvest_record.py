@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 
-from database.interface import PAGINATE_ENTRIES_PER_PAGE
+from database.interface import PAGINATE_ENTRIES_PER_PAGE, InvalidOrderByException
 
 
 def test_add_harvest_record(
@@ -97,10 +97,26 @@ def test_endpoint_order_by(
     assert db_records[0].identifier == "test-identifier-0"
     assert id_lookup_table[db_records[0].identifier] == db_records[0].id
 
-    # get results in descending order
+    # legacy literal: "desc" sorts the default column (date_created) descending
     db_records = interface.pget_harvest_records(order_by="desc")
     assert db_records[0].identifier == "test-identifier-99"
     assert id_lookup_table[db_records[0].identifier] == db_records[0].id
+
+    # sort by an explicit field, ascending
+    db_records = interface.pget_harvest_records(order_by="identifier")
+    assert db_records[0].identifier == "test-identifier-0"
+
+    # sort by an explicit field, descending via the "-" prefix
+    db_records = interface.pget_harvest_records(order_by="-identifier")
+    assert db_records[0].identifier == "test-identifier-99"
+
+    # an unrecognized field raises instead of silently using default ordering
+    try:
+        interface.pget_harvest_records(order_by="bogus")
+    except InvalidOrderByException as exc:
+        assert str(exc) == "Invalid order_by field: bogus"
+    else:
+        raise AssertionError("Expected InvalidOrderByException")
 
 
 def test_endpoint_count_for_non_paginated_methods(
@@ -182,6 +198,7 @@ def test_get_latest_harvest_records(
             "date_finished": None,
             "ckan_id": None,
             "action": "update",
+            "parent_identifier": None,
         },
         {
             "identifier": "b",
@@ -191,6 +208,7 @@ def test_get_latest_harvest_records(
             "date_finished": None,
             "ckan_id": None,
             "action": "create",
+            "parent_identifier": None,
         },
         {
             "identifier": "c",
@@ -200,6 +218,7 @@ def test_get_latest_harvest_records(
             "date_finished": None,
             "ckan_id": None,
             "action": "create",
+            "parent_identifier": None,
         },
         {
             "identifier": "e",
@@ -209,6 +228,7 @@ def test_get_latest_harvest_records(
             "date_finished": None,
             "ckan_id": None,
             "action": "create",
+            "parent_identifier": None,
         },
     ]
 

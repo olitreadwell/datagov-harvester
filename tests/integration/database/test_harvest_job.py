@@ -1,9 +1,87 @@
-from datetime import datetime, timezone
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
+from threading import Barrier
 
 from freezegun import freeze_time
-from sqlalchemy import text
+from sqlalchemy import asc, text
+from sqlalchemy.dialects import postgresql
+from sqlalchemy.orm import lazyload, sessionmaker
 
-from database.models import HarvestJobError
+from database.interface import HarvesterDBInterface
+from database.models import HarvestJob, HarvestJobError, HarvestSource, Organization, db
+
+
+def test_concurrent_manual_and_scheduled_enqueue_create_one_job(
+    organization_data, source_data_dcatus
+):
+    """Separate sessions must serialize their check and insert on the source."""
+    source_id = source_data_dcatus["id"]
+    source = HarvestSource(**source_data_dcatus)
+    source.date_next_run = datetime.now() - timedelta(days=1)
+    db.session.add_all([Organization(**organization_data), source])
+    db.session.commit()
+
+    sessions = sessionmaker(bind=db.engine)
+    start = Barrier(3)
+
+    def enqueue(scheduled):
+        session = sessions()
+        try:
+            interface = HarvesterDBInterface(session)
+            start.wait()
+            job, active = interface.enqueue_harvest_job_if_idle(
+                source_id,
+                next_run=datetime.now() + timedelta(days=1) if scheduled else None,
+                require_due=scheduled,
+            )
+            return (job.id if job else None, active.id if active else None)
+        finally:
+            session.close()
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        manual = executor.submit(enqueue, False)
+        scheduled = executor.submit(enqueue, True)
+        start.wait()
+        results = [manual.result(), scheduled.result()]
+
+    jobs = db.session.query(HarvestJob).filter_by(harvest_source_id=source_id).all()
+    assert len(jobs) == 1
+    assert sorted(job_id for job_id, _ in results if job_id) == [jobs[0].id]
+    assert sorted(active_id for _, active_id in results if active_id) == [jobs[0].id]
+
+
+def test_scheduled_enqueue_rechecks_due_source_after_lock(
+    organization_data, source_data_dcatus
+):
+    source_id = source_data_dcatus["id"]
+    source = HarvestSource(**source_data_dcatus)
+    source.date_next_run = datetime.now() - timedelta(days=1)
+    db.session.add_all([Organization(**organization_data), source])
+    db.session.commit()
+
+    sessions = sessionmaker(bind=db.engine)
+    stale_session = sessions()
+    other_session = sessions()
+    try:
+        stale_interface = HarvesterDBInterface(stale_session)
+        other_interface = HarvesterDBInterface(other_session)
+        assert len(stale_interface.get_due_harvest_sources()) == 1
+
+        next_run = datetime.now() + timedelta(days=1)
+        job, _ = other_interface.enqueue_harvest_job_if_idle(
+            source_id, next_run=next_run, require_due=True
+        )
+        other_interface.update_harvest_job(job.id, {"status": "complete"})
+
+        new_job, active_job = stale_interface.enqueue_harvest_job_if_idle(
+            source_id, next_run=next_run, require_due=True
+        )
+        assert new_job is None
+        assert active_job is None
+        assert stale_interface.get_harvest_source(source_id).date_next_run == next_run
+    finally:
+        stale_session.close()
+        other_session.close()
 
 
 def test_add_harvest_job_error(
@@ -142,6 +220,43 @@ def test_get_all_harvest_jobs_by_facet(
     assert filtered_list[0].harvest_source_id == source_data_dcatus["id"]
 
 
+def test_get_new_harvest_jobs_in_past_uses_skip_locked(
+    interface_no_jobs, source_data_dcatus
+):
+    source_id = source_data_dcatus["id"]
+    now = datetime.now(timezone.utc)
+
+    interface_no_jobs.add_harvest_job(
+        {
+            "status": "new",
+            "harvest_source_id": source_id,
+            "date_created": now - timedelta(minutes=10),
+        }
+    )
+
+    query = (
+        interface_no_jobs.db.query(HarvestJob)
+        .options(lazyload("*"))
+        .filter(
+            HarvestJob.date_created < now,
+            HarvestJob.status == "new",
+        )
+        .order_by(asc(HarvestJob.date_created))
+        .with_for_update(skip_locked=True)
+        .limit(10)
+    )
+
+    sql = str(
+        query.statement.compile(
+            dialect=postgresql.dialect(),
+            compile_kwargs={"literal_binds": True},
+        )
+    ).upper()
+
+    assert "FOR UPDATE" in sql
+    assert "SKIP LOCKED" in sql
+
+
 def get_new_harvest_jobs_in_past(interface_with_multiple_jobs):
     filtered_job_list = interface_with_multiple_jobs.get_new_harvest_jobs_in_past()
     all_jobs_list = interface_with_multiple_jobs.get_all_harvest_jobs()
@@ -164,29 +279,30 @@ def get_new_harvest_jobs_in_past(interface_with_multiple_jobs):
 
 
 @freeze_time("Jan 14th, 2012")
-def test_get_new_harvest_jobs_by_source_in_future(interface_with_multiple_jobs):
-    all_jobs_list = interface_with_multiple_jobs.pget_harvest_jobs(paginate=False)
-    source_id = all_jobs_list[0].harvest_source_id
-    filtered_job_list = (
-        interface_with_multiple_jobs.get_new_harvest_jobs_by_source_in_future(source_id)
+def test_get_due_harvest_sources(interface_no_jobs, source_data_dcatus):
+    source_id = source_data_dcatus["id"]
+    assert interface_no_jobs.get_due_harvest_sources() == []
+
+    interface_no_jobs.update_harvest_source(
+        source_id, {"date_next_run": datetime.now() + timedelta(days=1)}
     )
-    assert len(all_jobs_list) == 12
-    assert len(filtered_job_list) == 3
-    assert (
-        len(
-            [
-                x
-                for x in all_jobs_list
-                if x.status == "new"
-                and x.date_created.replace(
-                    tzinfo=timezone.utc
-                )  # TODO should we be pushing to UTC in db?
-                > datetime.now(timezone.utc)
-                and x.harvest_source_id == source_id
-            ]
-        )
-        == 3
+    assert interface_no_jobs.get_due_harvest_sources() == []
+
+    interface_no_jobs.update_harvest_source(
+        source_id, {"date_next_run": datetime.now() + timedelta(days=-1)}
     )
+    due = interface_no_jobs.get_due_harvest_sources()
+    assert len(due) == 1
+    assert due[0].id == source_id
+
+    interface_no_jobs.add_harvest_job(
+        {
+            "harvest_source_id": source_id,
+            "status": "new",
+            "date_created": datetime.now(),
+        }
+    )
+    assert interface_no_jobs.get_due_harvest_sources() == []
 
 
 def test_filter_jobs_by_faceted_filter(

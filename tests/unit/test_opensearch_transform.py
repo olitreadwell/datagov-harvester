@@ -5,13 +5,14 @@ These tests pin down how DCAT-US values are flattened into the existing
 """
 
 import json
-from pathlib import Path
 
 import pytest
 
+from dcatus_validation.schema_paths import DCATUS3_COMPLETE_EXAMPLE
 from search.transforms import (
     INDEX_FIELDS,
     DcatIndexTransformer,
+    coerce_access_level,
     coerce_identifier,
     coerce_keywords,
     coerce_publisher_name,
@@ -19,18 +20,6 @@ from search.transforms import (
     coerce_theme_labels,
     distribution_titles,
 )
-
-REPO_ROOT = Path(__file__).resolve().parents[2]
-DCAT3_COMPLETE_EXAMPLE = (
-    REPO_ROOT
-    / "schemas"
-    / "dcatus3.0"
-    / "examples"
-    / "Dataset"
-    / "good"
-    / "complete_example.json"
-)
-
 
 # ---------------------------------------------------------------------------
 # identifier: string search field
@@ -70,6 +59,12 @@ def test_coerce_identifier_ignores_extra_dcat3_object_fields():
     }
 
     assert coerce_identifier(value) == "https://example.gov/identifiers/dataset-1"
+
+
+def test_coerce_access_level_normalizes_case():
+    assert coerce_access_level("Public") == "public"
+    assert coerce_access_level("RESTRICTED PUBLIC") == "restricted public"
+    assert coerce_access_level("Non-Public") == "non-public"
 
 
 @pytest.mark.parametrize("value", [None, "", "   "])
@@ -230,6 +225,7 @@ def test_index_fields_registry_covers_expected_destinations():
         "title",
         "description",
         "publisher",
+        "access_level",
         "keyword",
         "theme",
         "identifier",
@@ -248,6 +244,7 @@ def test_transform_dcat1_dataset():
         "keyword": ["commitment of traders", "cot"],
         "theme": ["geospatial"],
         "identifier": "cftc-dc1",
+        "accessLevel": "public",
         "isPartOf": "collection-1",
         "distribution": [
             {"accessURL": "https://www.cftc.gov/index.htm"},
@@ -264,6 +261,7 @@ def test_transform_dcat1_dataset():
         "keyword": ["commitment of traders", "cot"],
         "theme": ["geospatial"],
         "identifier": "cftc-dc1",
+        "access_level": "public",
         "distribution_titles": ["Report CSV"],
     }
 
@@ -293,6 +291,7 @@ def test_transform_dcat3_dataset():
             "notation": "NCDC-CLIMATE-OBS-2024",
             "version": "1.0",
         },
+        "accessLevel": "restricted public",
         "inSeries": [
             {
                 "@id": "https://example.gov/series/annual-climate-observations",
@@ -315,6 +314,7 @@ def test_transform_dcat3_dataset():
         "keyword": ["climate", "weather"],
         "theme": ["Climate Science"],
         "identifier": "https://example.gov/identifiers/ncdc-climate-obs-2024",
+        "access_level": "restricted public",
         "distribution_titles": [
             "Climate Observations CSV",
             "Climate Observations JSON",
@@ -326,7 +326,7 @@ def test_transform_dcat3_dataset():
 
 
 def test_transform_real_dcat3_complete_example():
-    dcat = json.loads(DCAT3_COMPLETE_EXAMPLE.read_text())
+    dcat = json.loads(DCATUS3_COMPLETE_EXAMPLE.read_text())
 
     result = DcatIndexTransformer().transform(dcat)
 
@@ -350,6 +350,7 @@ def test_transform_handles_empty_dcat():
         "keyword": [],
         "theme": [],
         "identifier": "",
+        "access_level": "",
         "distribution_titles": [],
     }
 

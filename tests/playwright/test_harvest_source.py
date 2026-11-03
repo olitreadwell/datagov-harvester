@@ -1,3 +1,5 @@
+import re
+
 import pytest
 from playwright.sync_api import expect
 
@@ -24,6 +26,8 @@ class TestHarvestSourceUnauthed:
                 "Test Org",
                 "Name",
                 "Test Source",
+                "Description",
+                "N/A",
                 "URL",
                 "http://localhost:80/dcatus/dcatus.json",
                 "Frequency",
@@ -34,6 +38,12 @@ class TestHarvestSourceUnauthed:
                 "document",
                 "Notification frequency",
                 "always",
+                "Send harvest report",
+                "False",
+                "Is locked",
+                "False",
+                "Date next run",
+                "N/A",
                 "ID",
                 "2f2652de-91df-4c63-8b53-bfced20b276b",
             ]
@@ -51,7 +61,7 @@ class TestHarvestSourceUnauthed:
         # Test static labels and values
         expect(summary_table).to_contain_text("Records")
         expect(summary_table).to_contain_text("2")
-        expect(summary_table).to_contain_text("Last job errors and warnings")
+        expect(summary_table).to_contain_text("Outstanding record issues")
         expect(summary_table).to_contain_text("N/A")
         expect(summary_table).to_contain_text("Last job finished")
         expect(summary_table).to_contain_text("Next job scheduled")
@@ -67,7 +77,7 @@ class TestHarvestSourceUnauthed:
         # Test static content that doesn't change
         expect(first_row.nth(0)).to_contain_text("4e5f6a")  # Job ID (truncated)
         expect(first_row.nth(1)).to_contain_text("in_progress")  # Status
-        # Skip columns 2-4 (type, date_created, date_finished) as they're dynamic
+        # Skip columns 2-4 (type, date_created, duration) as they're dynamic
         expect(first_row.nth(5)).to_contain_text("0")  # records_added
         expect(first_row.nth(6)).to_contain_text("0")  # records_updated
         expect(first_row.nth(7)).to_contain_text("0")  # records_deleted
@@ -89,6 +99,10 @@ class TestHarvestSourceUnauthed:
         # glossary starts closed
         assert glossary.get_attribute("aria-hidden") == "true"
 
+        # Wait for glossary terms to be added by JavaScript
+        upage.locator(f"span[data-term='{data_term_name}']").wait_for(
+            state="attached", timeout=5000
+        )
         upage.click(f"span[data-term='{data_term_name}']")
         assert glossary.get_attribute("aria-hidden") == "false"
         glossary_elem = upage.locator(
@@ -106,16 +120,18 @@ class TestHarvestSourceUnauthed:
     def test_dataset_table(self, upage):
         """
         Checks to see if the dataset table is populated with the dataset.id,
-        dataset.type, and dataset.slug.
+        dataset.type, dataset.slug, and a catalog.data.gov link.
         """
         expect(upage.locator("#paginated__datasets table tr td")).to_have_text(
             [
                 "a1b2c3d4-e5f6-7890-abcd-ef1234567891",
                 "dataset",
                 "fixture-dataset-1",
+                "catalog",
                 "b2c3d4e5-f6a7-8901-bcde-f12345678902",
                 "dataset",
                 "fixture-dataset-2",
+                "catalog",
             ],
             use_inner_text=True,
         )
@@ -123,14 +139,18 @@ class TestHarvestSourceUnauthed:
 
 class TestHarvestSourceAuthed:
     def test_can_perform_actions(self, apage):
-        expect(
-            apage.locator(".harvest-source-config-actions ul li input")
-        ).to_have_text(["Edit", "Harvest", "Clear", "Delete"])
+        actions = apage.locator(".harvest-source-config-actions")
+        for name in ("Edit", "Harvest"):
+            expect(actions.get_by_role("button", name=name, exact=True)).to_be_visible()
+        for name in ("Lock", "Clear", "Delete"):
+            expect(
+                actions.get_by_role("button", name=re.compile(rf"^{name}\b"))
+            ).to_be_visible()
 
     def test_cant_delete_harvest_source_with_records(self, apage):
         apage.once("dialog", lambda dialog: dialog.accept())
-        apage.get_by_role("button", name="Delete", exact=True).click()
-        expect(apage.locator(".usa-alert--warning")).to_contain_text(
+        apage.get_by_role("button", name=re.compile(r"^Delete\b")).click()
+        expect(apage.locator(".usa-alert--error")).to_contain_text(
             ["Failed: 2 records in the Harvest source, please clear it first."]
         )
 

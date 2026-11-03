@@ -28,12 +28,9 @@ class TestHarvestAPICreateAndDestroy:
             },
             data=fixture_org,
         )
-        assert res.status == 200
-        assert (
-            # ruff: noqa: E501
-            res.json()["message"]
-            == f"Added new organization with ID: {org_id}"
-        )
+        assert res.status == 201
+        # API now returns full org data, not just a message
+        assert res.json()["id"] == org_id
         res = apage.request.delete(
             f"/api/v1/organization/{org_id}",
             headers={
@@ -88,7 +85,7 @@ class TestHarvestAPICreateAndDestroy:
         assert (
             # ruff: noqa: E501
             res.json()["message"]
-            == f"Added new harvest source with ID: {source_id}. No job scheduled for manual source."
+            == f"Added new harvest source with ID: {source_id}. No next run scheduled for manual source."
         )
         res = apage.request.delete(
             f"/api/v1/harvest_source/{source_id}",

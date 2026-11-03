@@ -1,3 +1,4 @@
+import json
 from datetime import date, datetime
 from types import SimpleNamespace
 
@@ -18,6 +19,28 @@ def test_normalize_dcat_dates():
     assert normalized["modified"] == "2024-01-02"
     assert normalized["issued"].startswith("2024-01-03T04:05:06")
     assert normalized["temporal"] == "123"
+
+
+def test_normalize_dcat_temporal_period_of_time_list():
+    """DCAT-US v3.0 temporal is a list of PeriodOfTime objects; it must be
+    serialized as valid JSON, not Python's repr-style str()."""
+    dcat = {
+        "temporal": [
+            {
+                "@type": "PeriodOfTime",
+                "startDate": "2019-01-01",
+                "endDate": "2020-12-31",
+            }
+        ],
+    }
+
+    normalized = DatasetDocument._normalize_dcat_dates(dcat)
+
+    assert normalized["temporal"] == (
+        '[{"@type": "PeriodOfTime", "endDate": "2020-12-31", '
+        '"startDate": "2019-01-01"}]'
+    )
+    assert json.loads(normalized["temporal"]) == dcat["temporal"]
 
 
 def test_normalize_dcat_spatial_object():
@@ -87,6 +110,33 @@ def test_normalize_dcat_preserves_publisher_suborganization_object():
     assert normalized["publisher"]["subOrganizationOf"] == {"name": "U.S. Government"}
 
 
+def test_normalize_dcat_strips_top_level_empty_key(caplog):
+    """A source feed can emit a malformed top-level property with an empty
+    string key (e.g. a stray spreadsheet column with no header). OpenSearch
+    rejects any document containing one outright, so it must be dropped
+    before indexing rather than left for OpenSearch to reject the whole
+    dataset over.
+    """
+    dcat = {
+        "title": "Status Of Budgetary Resources Total_CPE",
+        "": 43281,
+    }
+
+    normalized = DatasetDocument._normalize_dcat_dates(dcat, dataset_id="ba35e626")
+
+    assert "" not in normalized
+    assert normalized["title"] == "Status Of Budgetary Resources Total_CPE"
+    assert "ba35e626" in caplog.text
+
+
+def test_normalize_dcat_without_empty_key_is_unaffected():
+    dcat = {"title": "A normal dataset"}
+
+    normalized = DatasetDocument._normalize_dcat_dates(dcat)
+
+    assert normalized == {"title": "A normal dataset"}
+
+
 def test_dataset_to_document(sample_dataset, monkeypatch):
     monkeypatch.delenv("CATALOG_BASE_URL", raising=False)
 
@@ -97,7 +147,9 @@ def test_dataset_to_document(sample_dataset, monkeypatch):
     assert document["_id"] == sample_dataset.id
     assert document["title"] == "Dataset Title"
     assert document["publisher"] == "Publisher"
+    assert document["access_level"] == "public"
     assert document["dcat"]["isPartOf"] == "collection-1"
+    assert document["parent_identifier"] == "parent-1"
     assert document["distribution_titles"] == ["CSV download", "API endpoint"]
     assert document["has_spatial"] is True
     assert document["has_download"] is False
@@ -122,6 +174,17 @@ def test_dataset_to_document_handles_missing_date_and_organization(sample_datase
 
     assert document["last_harvested_date"] is None
     assert document["organization"] == {}
+
+
+def test_dataset_to_document_parent_identifier_missing_harvest_record(
+    sample_dataset,
+):
+    sample_dataset.harvest_record = None
+
+    dataset_doc = DatasetDocument(sample_dataset)
+    document = dataset_doc.dataset_to_document()
+
+    assert document["parent_identifier"] is None
 
 
 def test_dataset_to_document_uses_configured_catalog_base_url(
@@ -665,6 +728,29 @@ def test_dataset_to_document_flattens_dcat3_theme_and_identifier(sample_dataset)
     assert document["dcat"]["identifier"] == sample_dataset.dcat["identifier"]
     # inSeries is not aliased onto isPartOf.
     assert document["dcat"]["isPartOf"] == "collection-1"
+
+
+def test_dataset_to_document_serializes_v3_temporal_as_valid_json(mock_organization):
+    """A v3.0 PeriodOfTime `temporal` array must survive dataset_to_document
+    as valid, parseable JSON rather than a Python repr string."""
+    dcat = {
+        "title": "Temporal Dataset",
+        "description": "Dataset with v3.0 temporal",
+        "publisher": {"name": "Test Agency"},
+        "temporal": [
+            {
+                "@type": "PeriodOfTime",
+                "startDate": "2019-01-01",
+                "endDate": "2020-12-31",
+            }
+        ],
+    }
+    dataset = make_dataset_by_dcat(dcat, mock_organization)
+
+    dataset_doc = DatasetDocument(dataset)
+    document = dataset_doc.dataset_to_document()
+
+    assert json.loads(document["dcat"]["temporal"]) == dcat["temporal"]
 
 
 def test_dataset_to_document_carries_type(sample_dataset):

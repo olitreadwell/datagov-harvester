@@ -2,6 +2,7 @@ import json
 import logging
 import re
 import uuid
+from collections import Counter
 from unittest.mock import Mock, patch
 
 import pytest
@@ -434,7 +435,7 @@ class TestAuditLogging:
 
         response = client.post("/api/v1/organization/add", json=data, headers=headers)
 
-        assert response.status_code == 200
+        assert response.status_code == 201
         assert "Audit create organization" in caplog.text
         assert "user=<api_token>" in caplog.text
         assert "auth_type=api_token" in caplog.text
@@ -656,6 +657,16 @@ class TestJSONResponses:
                 404,
                 "No harvest_sources found for this query",
             ),
+            (
+                "/api/v1/harvest_sources/?facets=schema_type startswith_op dcatus",
+                200,
+                1,
+            ),
+            (
+                "/api/v1/harvest_sources/?facets=schema_type startswith_op nomatch",
+                404,
+                "No harvest_sources found for this query",
+            ),
         ],
     )
     def test_json_builder_query(
@@ -668,6 +679,8 @@ class TestJSONResponses:
             json_res = json.loads(res.data)
             if "count" in json_res:
                 assert json_res["count"] == response
+            elif "error" in json_res:
+                assert json_res["error"] == response
             else:
                 assert len(json_res) == response
         except Exception:
@@ -687,7 +700,7 @@ class TestJSONResponses:
                 "code_repo_url": None,
                 "description": "Fixture org description",
                 "id": "d925f84d-955b-4cb7-812f-dcfd6681a18f",
-                "logo": "https://raw.githubusercontent.com/GSA/datagov-harvester/refs/heads/main/app/static/assets/img/placeholder-organization.png",
+                "logo": "https://example.com/fixture-org-logo.png",
                 "name": "Test Org",
                 "organization_type": "Federal Government",
                 "slug": "fixture-org",
@@ -802,12 +815,104 @@ class TestAPIBehavior:
         job = interface.add_harvest_job(job_data_dcatus)
 
         # the value itself doesn't matter. we just want to mock stop_job so it completes.
-        LMMock.stop_job.return_value = "a test value"
+        LMMock.stop_job.return_value = ("a test value", "success")
 
         headers = {"X-API-Key": app.config["API_TOKEN"]}
         response = client.get(f"/api/v1/harvest_job/cancel/{job.id}", headers=headers)
         assert response.status_code == 302
         assert response.location == f"/harvest_job/{job.id}"
+
+    def test_job_add_rejects_a_second_active_job(
+        self, app, client, interface, organization_data, source_data_dcatus
+    ):
+        interface.add_organization(organization_data)
+        interface.add_harvest_source(source_data_dcatus)
+        headers = {"X-API-Key": app.config["API_TOKEN"]}
+        job_data = {
+            "harvest_source_id": source_data_dcatus["id"],
+            "status": "new",
+            "job_type": "harvest",
+        }
+
+        first = client.post("/api/v1/harvest_job/add", json=job_data, headers=headers)
+        second = client.post("/api/v1/harvest_job/add", json=job_data, headers=headers)
+
+        assert first.status_code == 200
+        assert second.status_code == 409
+        assert (
+            len(interface.get_queued_harvest_jobs_for_source(source_data_dcatus["id"]))
+            == 1
+        )
+
+    def test_job_add_accepts_scheduled_date(
+        self, app, client, interface, organization_data, source_data_dcatus
+    ):
+        interface.add_organization(organization_data)
+        interface.add_harvest_source(source_data_dcatus)
+        headers = {"X-API-Key": app.config["API_TOKEN"]}
+        job_data = {
+            "harvest_source_id": source_data_dcatus["id"],
+            "status": "new",
+            "date_created": "2030-01-01T00:00:00",
+        }
+
+        response = client.post(
+            "/api/v1/harvest_job/add", json=job_data, headers=headers
+        )
+
+        assert response.status_code == 200
+        queued = interface.get_queued_harvest_jobs_for_source(source_data_dcatus["id"])
+        assert len(queued) == 1
+        assert queued[0].date_created.year == 2030
+
+    @pytest.mark.parametrize(
+        "invalid_field",
+        [
+            {"unknown_field": "invalid"},
+            {"date_created": "not-a-date"},
+            {"records_total": "not-a-number"},
+        ],
+    )
+    def test_job_add_rejects_invalid_field(
+        self, app, client, source_data_dcatus, invalid_field
+    ):
+        headers = {"X-API-Key": app.config["API_TOKEN"]}
+        job_data = {
+            "harvest_source_id": source_data_dcatus["id"],
+            "status": "new",
+            **invalid_field,
+        }
+
+        with patch(
+            "app.api.harvest_jobs.deps.db.enqueue_harvest_job_if_idle"
+        ) as enqueue:
+            response = client.post(
+                "/api/v1/harvest_job/add", json=job_data, headers=headers
+            )
+
+        assert response.status_code == 400
+        enqueue.assert_not_called()
+
+    def test_job_add_reports_enqueue_error_as_server_error(
+        self, app, client, source_data_dcatus, caplog
+    ):
+        headers = {"X-API-Key": app.config["API_TOKEN"]}
+        job_data = {
+            "harvest_source_id": source_data_dcatus["id"],
+            "status": "new",
+        }
+
+        with patch(
+            "app.api.harvest_jobs.deps.db.enqueue_harvest_job_if_idle",
+            side_effect=RuntimeError("database unavailable"),
+        ):
+            response = client.post(
+                "/api/v1/harvest_job/add", json=job_data, headers=headers
+            )
+
+        assert response.status_code == 500
+        assert response.json == {"error": "Failed to add harvest job."}
+        assert "Failed to add harvest job" in caplog.text
 
     def test_invalid_harvest_job_type(self, app, client, source_data_dcatus):
         api_token = app.config["API_TOKEN"]
@@ -881,3 +986,705 @@ class TestRenderBlock:
                 )
 
             assert "Jinja autoescape is disabled" in str(exc_info.value)
+
+
+class TestRecordIssueSeverityAPI:
+    """Severity filtering on the record-issue endpoints.
+
+    The seeded fixtures contain only errors (severity falls to the column's
+    "error" server default), so each test adds its own warning row rather than
+    changing the shared fixture, whose row count other suites assert on.
+
+    Counts and ids here are derived from the fixture data rather than written
+    out, so adding or removing seeded rows doesn't strand this class.
+    """
+
+    # Nothing here reads the type column and nothing validates it against
+    # harvester.utils.dcat_warnings, so a synthetic type says what this row is.
+    # Naming a real warning would imply a coupling that doesn't exist, and would
+    # rot when that rule is renamed or dropped -- as invalid_iri just was.
+    WARNING_TYPE = "TestException"
+    WARNING_MESSAGE = "a synthetic warning row"
+
+    @pytest.fixture
+    def warning_record_id(self, record_error_data) -> str:
+        """A seeded record carrying more than one error.
+
+        Picking a record that already has several errors means the severity
+        filters have something to narrow on both sides: the added warning has
+        to be separated from real siblings, not from an empty set.
+        """
+        error_counts = Counter(e["harvest_record_id"] for e in record_error_data)
+        return next(record_id for record_id, count in error_counts.items() if count > 1)
+
+    @pytest.fixture
+    def seeded_error_count(self, warning_record_id, record_error_data) -> int:
+        """How many seeded errors belong to `warning_record_id`."""
+        return len(
+            [
+                e
+                for e in record_error_data
+                if e["harvest_record_id"] == warning_record_id
+            ]
+        )
+
+    @pytest.fixture
+    def interface_with_warning(
+        self, interface_with_fixture_json, job_data_dcatus, warning_record_id
+    ):
+        interface_with_fixture_json.add_harvest_record_error(
+            {
+                "harvest_record_id": warning_record_id,
+                "harvest_job_id": job_data_dcatus["id"],
+                "message": self.WARNING_MESSAGE,
+                "type": self.WARNING_TYPE,
+                "severity": "warning",
+            }
+        )
+        return interface_with_fixture_json
+
+    def test_collection_defaults_to_all_issues(
+        self, client, interface_with_warning, record_error_data
+    ):
+        """No severity param returns both severities, per #799.
+
+        Job-level reads default to every issue and surface `severity` on each
+        row rather than filtering; this endpoint matches that. The severity of
+        each row is in the response, so nothing is ambiguous.
+        """
+        res = client.get("/api/v1/harvest_record_errors/?paginate=False")
+
+        assert res.status_code == 200
+        assert {e["severity"] for e in res.json} == {"error", "warning"}
+        # every seeded error plus the warning this fixture added
+        assert len(res.json) == len(record_error_data) + 1
+
+    def test_severity_facet_is_not_double_filtered(
+        self, client, interface_with_warning
+    ):
+        """The facet DSL reaches severity without competing with a default.
+
+        Nothing is injected when severity is absent, so a severity facet is the
+        only condition on the column and can't be ANDed into an empty result.
+        """
+        res = client.get(
+            "/api/v1/harvest_record_errors/?facets=severity eq warning&paginate=False"
+        )
+
+        assert res.status_code == 200
+        assert {e["severity"] for e in res.json} == {"warning"}
+
+    def test_collection_severity_warning(self, client, interface_with_warning):
+        """?severity=warning returns only the warning row."""
+        res = client.get("/api/v1/harvest_record_errors/?severity=warning")
+
+        assert res.status_code == 200
+        assert [e["severity"] for e in res.json] == ["warning"]
+        assert res.json[0]["message"] == self.WARNING_MESSAGE
+
+    def test_collection_severity_error_excludes_warnings(
+        self, client, interface_with_warning, record_error_data
+    ):
+        """?severity=error excludes warnings.
+
+        count=True returns an int rather than rows, so the count is the only
+        observable here -- and it is the assertion: it has to come back one
+        short of the total for the warning to have been excluded.
+        """
+        res = client.get(
+            "/api/v1/harvest_record_errors/?severity=error&paginate=False&count=True"
+        )
+
+        assert res.status_code == 200
+        # every seeded issue is an error; this class's warning is filtered out
+        assert res.json["count"] == len(record_error_data)
+
+    def test_collection_severity_is_case_sensitive(
+        self, client, interface_with_warning
+    ):
+        """The DB enum is lowercase, so "Warning" is a client error, not a match."""
+        res = client.get("/api/v1/harvest_record_errors/?severity=Warning")
+
+        assert res.status_code == 400
+        assert "Invalid severity" in res.json["error"]
+
+    def test_collection_invalid_severity(self, client, interface_with_warning):
+        res = client.get("/api/v1/harvest_record_errors/?severity=bogus")
+
+        assert res.status_code == 400
+        assert "Invalid severity" in res.json["error"]
+        assert "error, warning" in res.json["error"]
+        # the rejected value is deliberately not echoed back (CodeQL: information
+        # exposure through an exception)
+        assert "bogus" not in res.json["error"]
+
+    def test_collection_severity_composes_with_facets(
+        self, client, interface_with_warning, warning_record_id, seeded_error_count
+    ):
+        """severity narrows a non-severity facet rather than replacing it.
+
+        Asserting every row still belongs to the faceted record is the point:
+        were severity replacing the facet instead of narrowing it, the
+        severities alone would still look right while other records' issues
+        leaked into the response.
+        """
+        route = (
+            "/api/v1/harvest_record_errors/"
+            f"?facets=harvest_record_id eq {warning_record_id}"
+        )
+
+        errors = client.get(f"{route}&severity=error")
+        assert errors.status_code == 200
+        assert {e["severity"] for e in errors.json} == {"error"}
+        assert {e["harvest_record_id"] for e in errors.json} == {warning_record_id}
+        assert len(errors.json) == seeded_error_count
+
+        warnings = client.get(f"{route}&severity=warning")
+        assert warnings.status_code == 200
+        assert [e["severity"] for e in warnings.json] == ["warning"]
+        assert {e["harvest_record_id"] for e in warnings.json} == {warning_record_id}
+
+    def test_severity_ignored_on_other_models(
+        self, client, interface_with_warning, job_error_data
+    ):
+        """harvest_job_error has no severity column; the param must not leak there.
+
+        These rows have no severity to assert against, so the check is that the
+        seeded job error comes back untouched. An empty result would surface as
+        the query's 404 rather than as a short list.
+        """
+        res = client.get("/api/v1/harvest_job_errors/?severity=warning")
+
+        assert res.status_code == 200
+        assert [e["message"] for e in res.json] == [job_error_data["message"]]
+
+    def test_record_route_reaches_warnings(
+        self, client, interface_with_warning, warning_record_id
+    ):
+        res = client.get(
+            f"/api/v1/harvest_record/{warning_record_id}/errors?severity=warning"
+        )
+
+        assert res.status_code == 200
+        assert [e["severity"] for e in res.json] == ["warning"]
+
+    def test_record_route_defaults_to_all_issues(
+        self, client, interface_with_warning, warning_record_id, seeded_error_count
+    ):
+        """No param returns both severities here too.
+
+        Worth asserting separately: the interface function this route calls
+        still defaults to "error", so the route has to pass None explicitly.
+        """
+        res = client.get(f"/api/v1/harvest_record/{warning_record_id}/errors")
+
+        assert res.status_code == 200
+        assert {e["severity"] for e in res.json} == {"error", "warning"}
+        # the record's seeded errors plus this class's warning
+        assert len(res.json) == seeded_error_count + 1
+
+    def test_record_route_invalid_severity(
+        self, client, interface_with_warning, warning_record_id
+    ):
+        """A bad severity is a 400, not the route's catch-all 404."""
+        res = client.get(
+            f"/api/v1/harvest_record/{warning_record_id}/errors?severity=bogus"
+        )
+
+        assert res.status_code == 400
+        assert "Invalid severity" in res.json["error"]
+
+
+class TestOrganizationCodeRepoFields:
+    """Test cases for code_repo_url and code_repo_exempt fields."""
+
+    def test_add_organization_with_code_repo_url(self, app, client, interface):
+        """Test creating organization with code repository URL."""
+        api_token = app.config["API_TOKEN"]
+        headers = {
+            "X-API-Key": api_token,
+            "Content-Type": "application/json",
+        }
+        data = {
+            "name": "Test Agency",
+            "slug": "test-agency",
+            "code_repo_url": "https://github.com/test-agency",
+        }
+        response = client.post("/api/v1/organization/add", json=data, headers=headers)
+
+        assert response.status_code == 201
+        response_data = response.get_json()
+        assert response_data["code_repo_url"] == "https://github.com/test-agency"
+        assert response_data["code_repo_exempt"] is False
+
+        # Verify organization saved with code_repo_url
+        org = interface.get_organization(response_data["id"])
+        assert org.code_repo_url == "https://github.com/test-agency"
+
+    def test_add_organization_with_code_repo_exempt(self, app, client, interface):
+        """Test creating organization with exempt flag."""
+        api_token = app.config["API_TOKEN"]
+        headers = {
+            "X-API-Key": api_token,
+            "Content-Type": "application/json",
+        }
+        data = {
+            "name": "Exempt Agency",
+            "slug": "exempt-agency",
+            "code_repo_exempt": True,
+        }
+        response = client.post("/api/v1/organization/add", json=data, headers=headers)
+
+        assert response.status_code == 201
+        response_data = response.get_json()
+        assert response_data["code_repo_exempt"] is True
+        assert response_data["code_repo_url"] is None
+
+        # Verify organization saved with code_repo_exempt
+        org = interface.get_organization(response_data["id"])
+        assert org.code_repo_exempt is True
+
+    def test_add_organization_invalid_url_protocol(self, app, client):
+        """Test URL validation rejects non-http protocols."""
+        api_token = app.config["API_TOKEN"]
+        headers = {
+            "X-API-Key": api_token,
+            "Content-Type": "application/json",
+        }
+        data = {
+            "name": "Test Agency",
+            "slug": "test-agency-invalid",
+            "code_repo_url": "ftp://github.com/test",
+        }
+        response = client.post("/api/v1/organization/add", json=data, headers=headers)
+
+        assert response.status_code == 422
+        response_data = response.get_json()
+        assert "detail" in response_data
+        assert "code_repo_url" in response_data["detail"]
+        assert "URL must start with http" in str(response_data["detail"])
+
+    def test_add_organization_empty_url(self, app, client, interface):
+        """Test empty URL is accepted (field is optional)."""
+        api_token = app.config["API_TOKEN"]
+        headers = {
+            "X-API-Key": api_token,
+            "Content-Type": "application/json",
+        }
+        data = {
+            "name": "Test Agency Empty URL",
+            "slug": "test-agency-empty",
+            "code_repo_url": "",
+        }
+        response = client.post("/api/v1/organization/add", json=data, headers=headers)
+
+        assert response.status_code == 201
+        response_data = response.get_json()
+        assert response_data["code_repo_url"] is None
+
+    def test_add_organization_conflict_warning(self, app, client):
+        """Test warning appears when both URL and exempt flag set."""
+        api_token = app.config["API_TOKEN"]
+        headers = {
+            "X-API-Key": api_token,
+            "Content-Type": "application/json",
+        }
+        data = {
+            "name": "Conflicted Agency",
+            "slug": "conflicted-agency",
+            "code_repo_url": "https://github.com/test",
+            "code_repo_exempt": True,
+        }
+        response = client.post("/api/v1/organization/add", json=data, headers=headers)
+
+        # Organization should be created with a warning (not an error)
+        assert response.status_code == 201
+        response_data = response.get_json()
+        assert "warning" in response_data
+        assert "both a repository URL and an exemption" in response_data["warning"]
+        assert response_data["code_repo_url"] == "https://github.com/test"
+        assert response_data["code_repo_exempt"] is True
+
+    def test_edit_organization_add_code_repo_url(
+        self, app, client, interface, organization_data
+    ):
+        """Test editing organization to add repository URL."""
+        # Create org without URL
+        interface.add_organization(organization_data)
+
+        api_token = app.config["API_TOKEN"]
+        headers = {
+            "X-API-Key": api_token,
+            "Content-Type": "application/json",
+        }
+        data = {
+            "name": organization_data["name"],
+            "slug": organization_data["slug"],
+            "code_repo_url": "https://github.com/test-org",
+        }
+        response = client.post(
+            f"/api/v1/organization/edit/{organization_data['id']}",
+            json=data,
+            headers=headers,
+        )
+
+        assert response.status_code == 200
+        # Verify URL saved
+        updated_org = interface.get_organization(organization_data["id"])
+        assert updated_org.code_repo_url == "https://github.com/test-org"
+
+    def test_edit_organization_with_both_fields_allows_partial_update(
+        self, app, client, interface, organization_data
+    ):
+        """Test that partial updates work when org has both URL and exempt flag set."""
+        # Create org with both fields set
+        org_data = organization_data.copy()
+        org_data["code_repo_url"] = "https://github.com/test-org"
+        org_data["code_repo_exempt"] = True
+        interface.add_organization(org_data)
+
+        api_token = app.config["API_TOKEN"]
+        headers = {
+            "X-API-Key": api_token,
+            "Content-Type": "application/json",
+        }
+
+        # Update only the name (reproducing the bug scenario)
+        data = {"name": "Renamed Organization"}
+        response = client.post(
+            f"/api/v1/organization/edit/{org_data['id']}",
+            json=data,
+            headers=headers,
+        )
+
+        # Should succeed with warning
+        assert response.status_code == 200
+        response_data = response.get_json()
+        assert "warning" in response_data
+        assert "both a repository URL and an exemption" in response_data["warning"]
+
+        # Verify name was updated and fields preserved
+        updated_org = interface.get_organization(org_data["id"])
+        assert updated_org.name == "Renamed Organization"
+        assert updated_org.code_repo_url == "https://github.com/test-org"
+        assert updated_org.code_repo_exempt is True
+
+    def test_organization_detail_displays_code_repo_fields(
+        self, client, interface, organization_data
+    ):
+        """Test organization detail page shows repository fields."""
+        # Create org with code repo URL
+        org_data = organization_data.copy()
+        org_data["code_repo_url"] = "https://github.com/GSA"
+        interface.add_organization(org_data)
+
+        response = client.get(f"/organization/{org_data['id']}")
+        assert response.status_code == 200
+        response_text = response.data.decode()
+        assert (
+            "Code repo URL" in response_text or "Code Repository URL" in response_text
+        )
+        assert "https://github.com/GSA" in response_text
+
+
+def test_harvest_source_list_displays_description(
+    client, interface, organization_data, source_data_dcatus
+):
+    """Test that harvest source list shows description column."""
+    interface.add_organization(organization_data)
+    source_data_dcatus["description"] = "Test harvest source description"
+    interface.add_harvest_source(source_data_dcatus)
+
+    response = client.get("/harvest_source_list/")
+    assert response.status_code == 200
+    response_text = response.data.decode()
+    assert "Description" in response_text
+    assert "Test harvest source description" in response_text
+
+
+def test_harvest_source_list_hides_url_column(
+    client, interface, organization_data, source_data_dcatus
+):
+    """Test that URL column is replaced by description in list view."""
+    interface.add_organization(organization_data)
+    interface.add_harvest_source(source_data_dcatus)
+
+    response = client.get("/harvest_source_list/")
+    assert response.status_code == 200
+    response_text = response.data.decode()
+    assert '<th scope="col">URL</th>' not in response_text
+    assert '<th scope="col">Description</th>' in response_text
+
+
+def test_harvest_source_detail_displays_description(
+    client, interface, organization_data, source_data_dcatus
+):
+    """Test that harvest source detail page shows description."""
+    interface.add_organization(organization_data)
+    source_data_dcatus["description"] = "Detailed source description"
+    source = interface.add_harvest_source(source_data_dcatus)
+
+    response = client.get(f"/harvest_source/{source.id}")
+    assert response.status_code == 200
+    response_text = response.data.decode()
+    assert "Detailed source description" in response_text
+
+
+def test_harvest_source_list_search_includes_description(
+    client, interface, organization_data, source_data_dcatus
+):
+    """Test that filter.js searches description field via data-meta."""
+    interface.add_organization(organization_data)
+    source_data_dcatus["description"] = "Environmental monitoring data"
+    interface.add_harvest_source(source_data_dcatus)
+
+    response = client.get("/harvest_source_list/")
+    assert response.status_code == 200
+    response_text = response.data.decode()
+    assert "Environmental monitoring data" in response_text
+    assert "data-meta=" in response_text
+
+
+class TestPaginationValidation:
+    """Test validation of pagination parameters across list endpoints."""
+
+    def test_per_page_zero_returns_empty_array(
+        self, client, interface, organization_data, source_data_dcatus
+    ):
+        """Test that per_page=0 returns HTTP 200 with empty array."""
+        interface.add_organization(organization_data)
+        interface.add_harvest_source(source_data_dcatus)
+
+        response = client.get("/api/v1/harvest_sources/?per_page=0")
+
+        assert response.status_code == 200
+        assert response.json == []
+
+    def test_per_page_negative_returns_422(
+        self, client, interface, organization_data, source_data_dcatus
+    ):
+        """Test that negative per_page returns HTTP 422 error."""
+        interface.add_organization(organization_data)
+        interface.add_harvest_source(source_data_dcatus)
+
+        response = client.get("/api/v1/harvest_sources/?per_page=-5")
+
+        assert response.status_code == 422
+        assert "per_page" in response.json.get("error", "").lower()
+
+    def test_per_page_one_returns_results(
+        self, client, interface, organization_data, source_data_dcatus
+    ):
+        """Test that per_page=1 returns exactly one result."""
+        interface.add_organization(organization_data)
+        interface.add_harvest_source(source_data_dcatus)
+
+        response = client.get("/api/v1/harvest_sources/?per_page=1")
+
+        assert response.status_code == 200
+        data = response.json
+        assert len(data) == 1
+
+    def test_per_page_validation_consistent_across_endpoints(
+        self, client, interface_with_fixture_json
+    ):
+        """Test that all list endpoints handle per_page=0 and negative values consistently."""
+        endpoints = [
+            "/api/v1/organizations/",
+            "/api/v1/harvest_sources/",
+            "/api/v1/harvest_jobs/",
+            "/api/v1/harvest_records/",
+            "/api/v1/harvest_job_errors/",
+            "/api/v1/harvest_record_errors/",
+        ]
+
+        for endpoint in endpoints:
+            # per_page=0 should return empty array
+            response = client.get(f"{endpoint}?per_page=0")
+            assert response.status_code == 200, f"{endpoint} should accept per_page=0"
+            assert (
+                response.json == []
+            ), f"{endpoint} should return empty array for per_page=0"
+
+            # Negative per_page should return 422
+            response = client.get(f"{endpoint}?per_page=-1")
+            assert (
+                response.status_code == 422
+            ), f"{endpoint} should reject negative per_page"
+            assert "per_page" in response.json.get("error", "").lower()
+
+
+class TestQueryParameterValidation:
+    """Test that invalid query parameters return proper JSON errors."""
+
+    def test_harvest_record_errors_rejects_harvest_source_id(self, client):
+        """Test that harvest_record_errors returns JSON error for harvest_source_id."""
+        response = client.get(
+            "/api/v1/harvest_record_errors/?harvest_source_id=35d79097-243c-414d-b67e-d8484397abc6"
+        )
+
+        assert response.status_code == 400
+        assert response.is_json
+        data = response.get_json()
+        assert "error" in data
+        assert "harvest_source_id" in data["error"]
+        assert "not a valid parameter" in data["error"]
+        assert "/harvest_record_errors/" in data["error"]
+
+    def test_harvest_job_errors_rejects_harvest_source_id(self, client):
+        """Test that harvest_job_errors returns JSON error for harvest_source_id."""
+        response = client.get(
+            "/api/v1/harvest_job_errors/?harvest_source_id=35d79097-243c-414d-b67e-d8484397abc6"
+        )
+
+        assert response.status_code == 400
+        assert response.is_json
+        data = response.get_json()
+        assert "error" in data
+        assert "harvest_source_id" in data["error"]
+        assert "not a valid parameter" in data["error"]
+        assert "/harvest_job_errors/" in data["error"]
+
+    def test_harvest_record_errors_accepts_harvest_job_id(
+        self, client, interface_with_fixture_json
+    ):
+        """Test that harvest_record_errors accepts harvest_job_id and filters correctly."""
+        job_id = "6bce761c-7a39-41c1-ac73-94234c139c76"
+        response = client.get(f"/api/v1/harvest_record_errors/?harvest_job_id={job_id}")
+
+        assert response.status_code == 200
+        data = response.get_json()
+        records = data["data"] if "data" in data else data
+        for record in records:
+            assert record["harvest_job_id"] == job_id
+
+    def test_harvest_job_errors_accepts_harvest_job_id(
+        self, client, interface_with_fixture_json
+    ):
+        """Test that harvest_job_errors accepts harvest_job_id and filters correctly."""
+        job_id = "6bce761c-7a39-41c1-ac73-94234c139c76"
+        response = client.get(f"/api/v1/harvest_job_errors/?harvest_job_id={job_id}")
+
+        assert response.status_code == 200
+        data = response.get_json()
+        errors = data["data"] if "data" in data else data
+        for error in errors:
+            assert error["harvest_job_id"] == job_id
+
+    def test_harvest_records_accepts_harvest_source_id(
+        self, client, interface_with_fixture_json
+    ):
+        """Test that harvest_records accepts harvest_source_id and filters correctly."""
+        source_id = "2f2652de-91df-4c63-8b53-bfced20b276b"
+        response = client.get(f"/api/v1/harvest_records/?harvest_source_id={source_id}")
+
+        assert response.status_code == 200
+        data = response.get_json()
+        records = data["data"] if "data" in data else data
+        for record in records:
+            assert record["harvest_source_id"] == source_id
+
+    def test_harvest_jobs_accepts_harvest_source_id(
+        self, client, interface_with_fixture_json
+    ):
+        """Test that harvest_jobs accepts harvest_source_id and filters correctly."""
+        source_id = "2f2652de-91df-4c63-8b53-bfced20b276b"
+        response = client.get(f"/api/v1/harvest_jobs/?harvest_source_id={source_id}")
+
+        assert response.status_code == 200
+        data = response.get_json()
+        jobs = data["data"] if "data" in data else data
+        for job in jobs:
+            assert job["harvest_source_id"] == source_id
+
+    def test_organizations_rejects_harvest_source_id(self, client):
+        """Test that organizations returns JSON error for harvest_source_id."""
+        response = client.get(
+            "/api/v1/organizations/?harvest_source_id=35d79097-243c-414d-b67e-d8484397abc6"
+        )
+
+        assert response.status_code == 400
+        assert response.is_json
+        data = response.get_json()
+        assert "error" in data
+        assert "harvest_source_id" in data["error"]
+
+    def test_harvest_record_errors_rejects_harvest_source_id_in_facets(self, client):
+        """Test that harvest_record_errors returns JSON error for harvest_source_id in facets."""
+        response = client.get(
+            "/api/v1/harvest_record_errors/?facets=harvest_source_id eq 35d79097-243c-414d-b67e-d8484397abc6"
+        )
+
+        assert response.status_code == 400
+        assert response.is_json
+        data = response.get_json()
+        assert "error" in data
+
+    def test_harvest_job_errors_rejects_harvest_source_id_in_facets(self, client):
+        """Test that harvest_job_errors returns JSON error for harvest_source_id in facets."""
+        response = client.get(
+            "/api/v1/harvest_job_errors/?facets=harvest_source_id eq 35d79097-243c-414d-b67e-d8484397abc6"
+        )
+
+        assert response.status_code == 400
+        assert response.is_json
+        data = response.get_json()
+        assert "error" in data
+
+    def test_harvest_sources_accepts_organization_id(
+        self, client, interface_with_fixture_json, organization_data
+    ):
+        """Test that harvest_sources accepts organization_id and filters correctly."""
+        org_id = organization_data["id"]
+        response = client.get(f"/api/v1/harvest_sources/?organization_id={org_id}")
+
+        assert response.status_code == 200
+        data = response.get_json()
+        sources = data["data"] if "data" in data else data
+        assert len(sources) > 0, "Should have at least one source"
+        for source in sources:
+            assert source["organization_id"] == org_id
+
+    def test_harvest_jobs_rejects_organization_id(self, client):
+        """Test that harvest_jobs returns JSON error for organization_id."""
+        response = client.get(
+            "/api/v1/harvest_jobs/?organization_id=35d79097-243c-414d-b67e-d8484397abc6"
+        )
+
+        assert response.status_code == 400
+        assert response.is_json
+        data = response.get_json()
+        assert "error" in data
+        assert "organization_id" in data["error"]
+
+    def test_harvest_job_errors_ignores_severity(self, client, job_error_data):
+        """Test that harvest_job_errors silently ignores severity parameter.
+
+        severity only exists on harvest_record_errors, so it is ignored elsewhere.
+        This matches the behavior documented in app/api/query.py line 100.
+        """
+        response = client.get("/api/v1/harvest_job_errors/?severity=error")
+
+        assert response.status_code in [200, 404]
+
+    def test_harvest_record_errors_accepts_severity(
+        self, client, interface_with_fixture_json
+    ):
+        """Test that harvest_record_errors accepts severity parameter and filters correctly."""
+        response = client.get("/api/v1/harvest_record_errors/?severity=error")
+
+        assert response.status_code == 200
+        data = response.get_json()
+        errors = data["data"] if "data" in data else data
+        for error in errors:
+            assert error["severity"] == "error"
+
+    def test_organizations_rejects_invalid_param(self, client):
+        """Test that organizations returns JSON error for any invalid parameter."""
+        response = client.get("/api/v1/organizations/?invalid_param=test")
+
+        assert response.status_code == 400
+        assert response.is_json
+        data = response.get_json()
+        assert "error" in data
+        assert "invalid_param" in data["error"]

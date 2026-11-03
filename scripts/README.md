@@ -17,11 +17,46 @@ $ cf env datagov-harvest | grep HARVEST_API_TOKEN
 $ export API_TOKEN=...
 $ cat harvest_source_ids.txt | while read id; do \
     curl -s -H "X-API-Key: ${API_TOKEN}" \
-    https://harvest-dev.data.gov/api/harvest_job/add \
-    --json "{\"harvest_source_id\": \"$id\", \"status\": \"new\", \"date_created\": \"$(TZ=UTC date -Iseconds -j -v +45M)\"}" ;
+    https://harvest-dev.data.gov/api/harvest_source/edit/$id \
+    --json "{\"date_next_run\": \"$(TZ=UTC date -Iseconds -j -v +45M)\"}" ;
   done
 ```
 
-This downloads the IDs for all of the harvest sources and then creates a new
-job for each source by ID at 45 minutes in the future. When that time in the
-near future passes, the harvest jobs will begin being worked through.
+This downloads the IDs for all of the harvest sources and then sets each
+source's next run 45 minutes in the future. When that time passes, the
+scheduler creates a job for the source and works through the queue under
+the running-task cap.
+
+## Force-Reharvesting Sources
+
+`flask harvest_source force_reharvest_sources` (in `app/commands/source.py`)
+force-reharvests harvest sources, optionally filtered by `schema_type` prefix
+(e.g. `dcatus`, `iso19115`) and/or by organization (id or slug). Both filters
+are repeatable and optional; omitting both force-reharvests every source. It's
+a Flask CLI command, not a standalone script, so it runs inside the app
+itself and uses whatever database it's already configured with, no separate
+DB connection setup needed.
+
+Locally:
+
+```bash
+docker compose exec app flask harvest_source force_reharvest_sources --schema-type-prefix dcatus
+docker compose exec app flask harvest_source force_reharvest_sources --organization census-bureau
+```
+
+Against a deployed environment (e.g. prod), run it as a one-off task instead
+of a local script, the same way other one-off admin commands run there (see
+`docs/developer.md`):
+
+```bash
+cf run-task datagov-harvest --command "flask harvest_source force_reharvest_sources --schema-type-prefix dcatus"
+```
+
+Dry-run mode is on by default. Add `--no-dry-run` to actually queue the jobs.
+This only inserts `HarvestJob` rows with `status="new"` and
+`job_type="force_harvest"`, one per matching source that doesn't already have
+an active job; it does not start any CF tasks itself. The app's own scheduler
+(`LoadManager._start_new_jobs`, which already runs on a periodic schedule)
+picks up "new" jobs and starts them under the existing
+`HARVEST_RUNNER_MAX_TASKS` cap, the same way it drains regularly-scheduled
+harvests.

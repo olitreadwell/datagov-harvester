@@ -1,9 +1,9 @@
-import json
 from datetime import timedelta
 
 from flask import flash, redirect, render_template, request, session, url_for
 
 from app import deps, htmx
+from app.constants import MAX_UPLOAD_BYTES, MAX_UPLOAD_MB
 from app.deps import (
     _log_mutation,
     logger,
@@ -11,7 +11,6 @@ from app.deps import (
 )
 from app.forms import DatasetSlugForm, ValidatorForm
 from app.paginate import Pagination
-from app.util import fetch_json_from_url, validate_records
 from harvester.utils.general_utils import (
     convert_to_int,
     get_datetime,
@@ -33,7 +32,7 @@ def view_dataset(dataset_slug: str):
 
     if request.method == "POST":
         if not session.get("user"):
-            flash("You must be logged in to edit a dataset slug.")
+            flash("You must be logged in to edit a dataset slug.", "error")
             return redirect(url_for("main.view_dataset", dataset_slug=dataset_slug))
 
         form = DatasetSlugForm(
@@ -42,7 +41,7 @@ def view_dataset(dataset_slug: str):
             db_interface=deps.db,
         )
         if dataset is None:
-            flash("Dataset not found.")
+            flash("Dataset not found.", "error")
             return redirect(url_for("main.harvest_source_list"))
 
         if form.validate():
@@ -74,7 +73,7 @@ def view_dataset(dataset_slug: str):
             else:
                 flash(
                     f"Failed to update slug. Error: {os_error}",
-                    "danger",
+                    "error",
                 )
                 return redirect(url_for("main.view_dataset", dataset_slug=dataset_slug))
         else:
@@ -260,63 +259,18 @@ def openapi_docs():
     return render_template("/swagger.html")
 
 
-@main.route("/validate/", methods=["GET", "POST"])
+@main.route("/validate/", methods=["GET"])
 def view_validators():
-    """View for validating v1.1 or v3.0 dcatus catalogs using form."""
-    errors = []
-    submitted = False
-
+    """The DCAT-US validator page. The browser submits it with a same-origin
+    fetch() to /api/v1/validate (app/static/js/view_validators.js), which
+    datagov-harvest-proxy routes to the separate validator app
+    (validator_api/) - this app never validates anything itself, so a slow
+    or hostile submission can't tie up its workers."""
     form = ValidatorForm()
-    if form.validate_on_submit():
-        data = []
-        if form.fetch_method.data == "url":
-            try:
-                data = fetch_json_from_url(form.url.data)
-            except Exception as e:
-                form.url.errors.append(str(e))
-        elif form.fetch_method.data == "paste":
-            try:
-                data = json.loads(form.json_text.data)
-            except Exception as e:
-                form.json_text.errors.append(str(e))
-        elif form.fetch_method.data == "upload":
-            try:
-                raw = form.json_file.data.read()
-                data = json.loads(raw)
-            except json.JSONDecodeError as e:
-                form.json_file.errors.append(f"Invalid JSON in uploaded file: {e}")
-            except Exception as e:
-                form.json_file.errors.append(str(e))
-
-        if not form.errors:
-            submitted = True
-            errors = validate_records(data, form.schema.data)
-            logger.info(
-                "Rendered validator results fetch_method=%s schema=%s "
-                "validation_errors=%s",
-                form.fetch_method.data,
-                form.schema.data,
-                len(errors),
-            )
-        else:
-            logger.warning(
-                "Validator submission failed fetch_method=%s url_errors=%s "
-                "json_errors=%s",
-                form.fetch_method.data,
-                len(form.url.errors),
-                len(form.json_text.errors),
-            )
-
-    template_data = {
-        "record_errors": errors,
-    }
-
-    if request.method == "GET":
-        logger.info("Rendered validator page")
-
+    logger.info("Rendered validator page")
     return render_template(
         "view_validators.html",
         form=form,
-        data=template_data,
-        submitted=submitted,
+        max_upload_bytes=MAX_UPLOAD_BYTES,
+        max_upload_mb=MAX_UPLOAD_MB,
     )

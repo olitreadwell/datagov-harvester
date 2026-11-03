@@ -1,8 +1,9 @@
-name: 2 - Deploy
+name: 2 - Deploy (main branch only)
 on:
   push:
     branches:
       - main
+  workflow_dispatch:
 
 # default minimal permissions for every job
 permissions:
@@ -11,22 +12,21 @@ permissions:
 concurrency:
   group: release-main
   cancel-in-progress: false
+  queue: max
 
 jobs:
   detect-opensearch-migration:
     name: Detect OpenSearch migration
+    if: github.ref == 'refs/heads/main'
     permissions:
-      actions: read
       contents: read
       pull-requests: read
     uses: ./.github/workflows/detect-opensearch-migration.yml
-    with:
-      workflow_file: deploy.yml
-      branch: main
 
   release-staging:
     name: Release staging
     needs: detect-opensearch-migration
+    if: github.ref == 'refs/heads/main'
     permissions:
       contents: read
       issues: write
@@ -42,6 +42,7 @@ jobs:
     needs:
       - detect-opensearch-migration
       - release-staging
+    if: github.ref == 'refs/heads/main'
     permissions:
       contents: read
       issues: write

@@ -1,4 +1,5 @@
 import http
+import itertools
 import json
 import logging
 import time
@@ -13,11 +14,21 @@ from requests.exceptions import ConnectionError
 
 from database.interface import HarvesterDBInterface
 from database.models import HarvestSource
+from dcatus_validation import messages
+from dcatus_validation.fetch import USER_AGENT
+from dcatus_validation.messages import (
+    assemble_validation_errors,
+    build_dcatus3_validator,
+)
+from dcatus_validation.schema_paths import (
+    DCATUS3_COMPLETE_EXAMPLE,
+    DCATUS3_DEFINITIONS_DIR,
+)
+from harvester.utils import general_utils
 from harvester.utils.general_utils import (
     DT_PLACEHOLDER,
-    USER_AGENT,
+    RESOLVED_IDENTIFIER_KEY,
     RetrySession,
-    assemble_validation_errors,
     backfill_catalog_record_identifiers,
     create_retry_session,
     describe_identifier_error,
@@ -38,11 +49,27 @@ from harvester.utils.general_utils import (
     prepare_distributions,
     prepare_transform_msg,
     process_job_complete_percentage,
+    resolve_object_identifier,
+    sort_dataset,
     strip_dcatus3_catalog_objects,
     translate_spatial,
     translate_spatial_to_geojson,
+    translate_wkt_to_geojson,
     validate_geojson,
 )
+
+# Real DCAT-US 3.0 validator, used to reproduce assembler errors on the
+# complete example.
+DCATUS3_DATASET_VALIDATOR = build_dcatus3_validator(
+    DCATUS3_DEFINITIONS_DIR,
+    root_ref="https://resources.data.gov/dcat-us/3.0.0/definitions/dataset",
+)
+
+
+@pytest.fixture
+def dcatus3_complete_example():
+    with open(DCATUS3_COMPLETE_EXAMPLE) as f:
+        return json.load(f)
 
 
 class TestCKANUtils:
@@ -127,15 +154,17 @@ class TestCKANUtils:
                                 [180.0, 50.0],
                                 [170.0, 50.0],
                                 [170.0, 40.0],
-                            ],
+                            ]
+                        ],
+                        [
                             [
                                 [-180.0, 40.0],
-                                [-180.0, 50.0],
-                                [-170.0, 50.0],
                                 [-170.0, 40.0],
+                                [-170.0, 50.0],
+                                [-180.0, 50.0],
                                 [-180.0, 40.0],
-                            ],
-                        ]
+                            ]
+                        ],
                     ],
                 }
             )
@@ -159,15 +188,17 @@ class TestCKANUtils:
                                 [-180.0, 50.0],
                                 [-180.0, 40.0],
                                 [-170.0, 40.0],
-                            ],
+                            ]
+                        ],
+                        [
                             [
                                 [180.0, 50.0],
-                                [180.0, 40.0],
-                                [170.0, 40.0],
                                 [170.0, 50.0],
+                                [170.0, 40.0],
+                                [180.0, 40.0],
                                 [180.0, 50.0],
-                            ],
-                        ]
+                            ]
+                        ],
                     ],
                 }
             )
@@ -245,6 +276,372 @@ class TestCKANUtils:
             "coordinates": [-88.9718, 36.52033],
         }
 
+    def test_translate_wkt_to_geojson_polygon(self):
+        assert translate_wkt_to_geojson(
+            "POLYGON((-125 24, -66 24, -66 50, -125 50, -125 24))"
+        ) == (
+            '{"type": "Polygon", "coordinates": '
+            "[[[-125.0, 24.0], [-66.0, 24.0], [-66.0, 50.0], "
+            "[-125.0, 50.0], [-125.0, 24.0]]]}"
+        )
+
+    def test_translate_wkt_to_geojson_point(self):
+        assert (
+            translate_wkt_to_geojson("POINT (0.0 0.0)")
+            == '{"type": "Point", "coordinates": [0.0, 0.0]}'
+        )
+
+    def test_translate_wkt_to_geojson_case_insensitive(self):
+        assert translate_wkt_to_geojson(
+            "polygon((-125 24, -66 24, -66 50, -125 50, -125 24))"
+        ) == (
+            '{"type": "Polygon", "coordinates": '
+            "[[[-125.0, 24.0], [-66.0, 24.0], [-66.0, 50.0], "
+            "[-125.0, 50.0], [-125.0, 24.0]]]}"
+        )
+
+    def test_translate_wkt_to_geojson_z_dimension_is_dropped(self):
+        # GeoJSON is 2D; a Z/M dimension must be dropped rather than left
+        # in place for geojson_validator to reject as "3d_coordinates".
+        assert translate_wkt_to_geojson(
+            "POLYGON Z ((-125 24 0, -66 24 0, -66 50 0, -125 50 0, -125 24 0))"
+        ) == (
+            '{"type": "Polygon", "coordinates": '
+            "[[[-125.0, 24.0], [-66.0, 24.0], [-66.0, 50.0], "
+            "[-125.0, 50.0], [-125.0, 24.0]]]}"
+        )
+
+    def test_translate_wkt_to_geojson_non_wkt_string(self):
+        assert translate_wkt_to_geojson("somewhere over there") == ""
+
+    def test_translate_wkt_to_geojson_place_name_not_mistaken_for_wkt(self):
+        # A real place name that starts with a WKT keyword word must not be
+        # treated as WKT -- the geometry-type token alone isn't enough, it
+        # must be followed by "(" (optionally after a Z/M/ZM marker).
+        assert translate_wkt_to_geojson("Point Pleasant, New Jersey") == ""
+
+    def test_translate_wkt_to_geojson_empty_geometry(self):
+        # WKT "EMPTY" geometries carry no coordinates; they must not be
+        # mistaken for a valid, resolvable geometry.
+        assert translate_wkt_to_geojson("POINT EMPTY") == ""
+
+    def test_translate_wkt_to_geojson_malformed_wkt(self):
+        # Looks like WKT (has the "POLYGON" prefix) but isn't parseable.
+        assert translate_wkt_to_geojson("POLYGON((not valid))") == ""
+
+    def test_translate_wkt_to_geojson_degenerate_polygon_becomes_point(self):
+        # Coordinate rounding can collapse a small survey area's bbox onto
+        # a single point. shapely parses this ring fine, but
+        # geojson_validator rejects it (less_three_unique_nodes) unless we
+        # reduce it the same way munge_spatial does for v1.1 bboxes.
+        assert (
+            translate_wkt_to_geojson(
+                "POLYGON((-115.63 32.49, -115.63 32.49, -115.63 32.49, "
+                "-115.63 32.49, -115.63 32.49))"
+            )
+            == '{"type": "Point", "coordinates": [-115.63, 32.49]}'
+        )
+
+    def test_translate_wkt_to_geojson_degenerate_polygon_becomes_linestring(self):
+        # Two unique corners (a sliver) reduces to a LineString rather than
+        # being rejected as a degenerate Polygon.
+        assert translate_wkt_to_geojson(
+            "POLYGON((-87.88 43.34, -87.88 43.35, -87.88 43.35, "
+            "-87.88 43.34, -87.88 43.34))"
+        ) == (
+            '{"type": "LineString", "coordinates": '
+            "[[-87.88, 43.34], [-87.88, 43.35]]}"
+        )
+
+    def test_translate_wkt_to_geojson_valid_triangle_unaffected(self):
+        # Three unique corners is a valid, non-degenerate Polygon and must
+        # not be reduced.
+        assert translate_wkt_to_geojson("POLYGON((0 0, 1 0, 0 1, 0 0))") == (
+            '{"type": "Polygon", "coordinates": '
+            "[[[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [0.0, 0.0]]]}"
+        )
+
+    def test_translate_spatial_to_geojson_degenerate_wkt_polygon(self):
+        # End-to-end through translate_spatial_to_geojson: a degenerate WKT
+        # bbox must resolve to a geometry instead of being dropped (None).
+        geojson = translate_spatial_to_geojson(
+            "POLYGON((-115.63 32.49, -115.63 32.49, -115.63 32.49, "
+            "-115.63 32.49, -115.63 32.49))"
+        )
+        assert geojson == {"type": "Point", "coordinates": [-115.63, 32.49]}
+
+    def test_translate_spatial_to_geojson_wkt_polygon(self):
+        geojson = translate_spatial_to_geojson(
+            "POLYGON((-125 24, -66 24, -66 50, -125 50, -125 24))"
+        )
+        assert geojson == {
+            "type": "Polygon",
+            "coordinates": [
+                [
+                    [-125.0, 24.0],
+                    [-66.0, 24.0],
+                    [-66.0, 50.0],
+                    [-125.0, 50.0],
+                    [-125.0, 24.0],
+                ]
+            ],
+        }
+
+    def test_translate_spatial_wkt_point(self):
+        assert translate_spatial("POINT (0.0 0.0)") == (
+            '{"type": "Point", "coordinates": [0.0, 0.0]}'
+        )
+
+    def test_translate_spatial_location_object_wkt_geometry(self):
+        location = {
+            "@id": "https://example.gov/locations/usa",
+            "@type": "Location",
+            "geometry": "POLYGON((-125 24, -66 24, -66 50, -125 50, -125 24))",
+        }
+        assert translate_spatial(location) == (
+            '{"type": "Polygon", "coordinates": '
+            "[[[-125.0, 24.0], [-66.0, 24.0], [-66.0, 50.0], "
+            "[-125.0, 50.0], [-125.0, 24.0]]]}"
+        )
+
+    def test_translate_spatial_location_object_geojson_geometry(self):
+        location = {
+            "@type": "Location",
+            "geometry": {"type": "Point", "coordinates": [-77.0369, 38.9072]},
+        }
+        assert translate_spatial(location) == (
+            '{"type": "Point", "coordinates": [-77.0369, 38.9072]}'
+        )
+
+    def test_translate_spatial_location_array_uses_first(self):
+        locations = [
+            {"@type": "Location", "geometry": "POINT (0.0 0.0)"},
+            {"@type": "Location", "geometry": "POINT (1.0 1.0)"},
+        ]
+        assert translate_spatial(locations) == (
+            '{"type": "Point", "coordinates": [0.0, 0.0]}'
+        )
+
+    def test_translate_spatial_location_array_geometry_after_pref_label_skips_lookup(
+        self,
+    ):
+        locations = [
+            {"@type": "Location", "prefLabel": "Nebraska"},
+            {"@type": "Location", "geometry": "POINT (1.0 1.0)"},
+        ]
+        fake_dbi = Mock(get_geo_from_string=Mock())
+        with patch(
+            "harvester.utils.general_utils._get_geo_lookup_interface",
+            lambda: fake_dbi,
+        ):
+            assert translate_spatial(locations) == (
+                '{"type": "Point", "coordinates": [1.0, 1.0]}'
+            )
+        fake_dbi.get_geo_from_string.assert_not_called()
+
+    def test_translate_spatial_location_array_falls_back_to_pref_label_db_hit(self):
+        locations = [
+            {"@type": "Location", "prefLabel": "Nebraska"},
+            {"@type": "Location", "altLabel": "NE"},
+        ]
+        fake_dbi = Mock(
+            get_geo_from_string=Mock(
+                return_value='{"type": "Point", "coordinates": [-99.9018, 41.4925]}'
+            )
+        )
+        with patch(
+            "harvester.utils.general_utils._get_geo_lookup_interface",
+            lambda: fake_dbi,
+        ):
+            assert translate_spatial(locations) == (
+                '{"type": "Point", "coordinates": [-99.9018, 41.4925]}'
+            )
+        fake_dbi.get_geo_from_string.assert_called_once_with("Nebraska")
+
+    def test_translate_spatial_location_array_falls_back_to_pref_label_db_miss(self):
+        locations = [
+            {"@type": "Location", "prefLabel": "Nebraska"},
+            {"@type": "Location", "altLabel": "NE"},
+        ]
+        fake_dbi = Mock(get_geo_from_string=Mock(return_value=None))
+        with patch(
+            "harvester.utils.general_utils._get_geo_lookup_interface",
+            lambda: fake_dbi,
+        ):
+            assert translate_spatial(locations) == ""
+            fake_dbi.get_geo_from_string.assert_called_once_with("Nebraska")
+            fake_dbi.get_geo_from_string.reset_mock()
+            assert translate_spatial_to_geojson(locations) is None
+            fake_dbi.get_geo_from_string.assert_called_once_with("Nebraska")
+
+    def test_translate_spatial_location_bbox_centroid_geometry_all_present_prefers_bbox(
+        self,
+    ):
+        location = {
+            "@type": "Location",
+            "geometry": "POINT (1.0 1.0)",
+            "centroid": {"type": "Point", "coordinates": [2.0, 2.0]},
+            "bbox": {"type": "Point", "coordinates": [3.0, 3.0]},
+        }
+        assert translate_spatial(location) == (
+            '{"type": "Point", "coordinates": [3.0, 3.0]}'
+        )
+
+    def test_translate_spatial_location_centroid_and_geometry_prefers_centroid(self):
+        location = {
+            "@type": "Location",
+            "geometry": "POINT (1.0 1.0)",
+            "centroid": {"type": "Point", "coordinates": [2.0, 2.0]},
+        }
+        assert translate_spatial(location) == (
+            '{"type": "Point", "coordinates": [2.0, 2.0]}'
+        )
+
+    def test_translate_spatial_location_array_pref_label_wins_over_earlier_alt_label(
+        self,
+    ):
+        locations = [
+            {"@type": "Location", "altLabel": "NE"},
+            {"@type": "Location", "prefLabel": "Nebraska"},
+        ]
+        fake_dbi = Mock(
+            get_geo_from_string=Mock(
+                return_value='{"type": "Point", "coordinates": [-99.9018, 41.4925]}'
+            )
+        )
+        with patch(
+            "harvester.utils.general_utils._get_geo_lookup_interface",
+            lambda: fake_dbi,
+        ):
+            assert translate_spatial(locations) == (
+                '{"type": "Point", "coordinates": [-99.9018, 41.4925]}'
+            )
+        fake_dbi.get_geo_from_string.assert_called_once_with("Nebraska")
+
+    def test_translate_spatial_location_array_falls_back_to_alt_label_db_hit(self):
+        locations = [
+            {"@type": "Location", "altLabel": "NE"},
+        ]
+        fake_dbi = Mock(
+            get_geo_from_string=Mock(
+                return_value='{"type": "Point", "coordinates": [-99.9018, 41.4925]}'
+            )
+        )
+        with patch(
+            "harvester.utils.general_utils._get_geo_lookup_interface",
+            lambda: fake_dbi,
+        ):
+            assert translate_spatial(locations) == (
+                '{"type": "Point", "coordinates": [-99.9018, 41.4925]}'
+            )
+        fake_dbi.get_geo_from_string.assert_called_once_with("NE")
+
+    def test_translate_spatial_location_falls_back_to_bbox(self):
+        location = {
+            "@type": "Location",
+            "bbox": {
+                "type": "Polygon",
+                "coordinates": [
+                    [
+                        [-77.119759, 38.791645],
+                        [-76.909393, 38.791645],
+                        [-76.909393, 38.99538],
+                        [-77.119759, 38.99538],
+                        [-77.119759, 38.791645],
+                    ]
+                ],
+            },
+        }
+        geojson = translate_spatial_to_geojson(location)
+        assert geojson["type"] == "Polygon"
+
+    def test_translate_spatial_location_falls_back_to_centroid(self):
+        location = {
+            "@type": "Location",
+            "centroid": {"type": "Point", "coordinates": [-77.0369, 38.9072]},
+        }
+        assert translate_spatial(location) == (
+            '{"type": "Point", "coordinates": [-77.0369, 38.9072]}'
+        )
+
+    def test_translate_spatial_location_pref_label_only_db_hit(self):
+        location = {"@type": "Location", "prefLabel": "Washington, D.C."}
+        fake_dbi = Mock(
+            get_geo_from_string=Mock(
+                return_value='{"type": "Point", "coordinates": [-77.0369, 38.9072]}'
+            )
+        )
+        with patch(
+            "harvester.utils.general_utils._get_geo_lookup_interface",
+            lambda: fake_dbi,
+        ):
+            assert translate_spatial(location) == (
+                '{"type": "Point", "coordinates": [-77.0369, 38.9072]}'
+            )
+        fake_dbi.get_geo_from_string.assert_called_once_with("Washington, D.C.")
+
+    def test_translate_spatial_location_pref_label_only_db_miss(self):
+        location = {"@type": "Location", "prefLabel": "Washington, D.C."}
+        fake_dbi = Mock(get_geo_from_string=Mock(return_value=None))
+        with patch(
+            "harvester.utils.general_utils._get_geo_lookup_interface",
+            lambda: fake_dbi,
+        ):
+            assert translate_spatial(location) == ""
+            fake_dbi.get_geo_from_string.assert_called_once_with("Washington, D.C.")
+            fake_dbi.get_geo_from_string.reset_mock()
+            assert translate_spatial_to_geojson(location) is None
+            fake_dbi.get_geo_from_string.assert_called_once_with("Washington, D.C.")
+
+    def test_translate_spatial_location_alt_label_only_db_hit(self):
+        location = {"@type": "Location", "altLabel": "D.C."}
+        fake_dbi = Mock(
+            get_geo_from_string=Mock(
+                return_value='{"type": "Point", "coordinates": [-77.0369, 38.9072]}'
+            )
+        )
+        with patch(
+            "harvester.utils.general_utils._get_geo_lookup_interface",
+            lambda: fake_dbi,
+        ):
+            assert translate_spatial(location) == (
+                '{"type": "Point", "coordinates": [-77.0369, 38.9072]}'
+            )
+        fake_dbi.get_geo_from_string.assert_called_once_with("D.C.")
+
+    def test_translate_spatial_location_alt_label_only_db_miss(self):
+        location = {"@type": "Location", "altLabel": "D.C."}
+        fake_dbi = Mock(get_geo_from_string=Mock(return_value=None))
+        with patch(
+            "harvester.utils.general_utils._get_geo_lookup_interface",
+            lambda: fake_dbi,
+        ):
+            assert translate_spatial(location) == ""
+            fake_dbi.get_geo_from_string.assert_called_once_with("D.C.")
+            fake_dbi.get_geo_from_string.reset_mock()
+            assert translate_spatial_to_geojson(location) is None
+            fake_dbi.get_geo_from_string.assert_called_once_with("D.C.")
+
+    def test_translate_spatial_location_input_unchanged(self):
+        location = {
+            "@type": "Location",
+            "geometry": "POLYGON((-125 24, -66 24, -66 50, -125 50, -125 24))",
+        }
+        original = json.loads(json.dumps(location))
+        translate_spatial(location)
+        assert location == original
+
+    def test_translate_spatial_bare_geojson_dict_unaffected_by_unwrap(self):
+        assert translate_spatial({"type": "Point", "coordinates": [-55.1, 37.2]}) == (
+            '{"type": "Point", "coordinates": [-55.1, 37.2]}'
+        )
+
+    def test_translate_spatial_dcatus3_complete_example_spatial(
+        self, dcatus3_complete_example
+    ):
+        geojson = translate_spatial_to_geojson(dcatus3_complete_example["spatial"])
+        assert geojson["type"] == "Polygon"
+
 
 # Point example
 # "{\"type\": \"Point\", \"coordinates\": [-87.08258, 24.9579]}"
@@ -285,8 +682,8 @@ class TestGeneralUtils:
         """Test that the default waf datetime is now / the time of program execution"""
 
         page_html = """<html><body><pre>
-          <a href="file1.xml">file1.xml</a>   12K  
-          <a href="file2.xml">file2.xml</a>   12K  
+          <a href="file1.xml">file1.xml</a>   12K
+          <a href="file2.xml">file2.xml</a>   12K
           </pre></body></html>"""
 
         soup = BeautifulSoup(page_html)
@@ -299,6 +696,50 @@ class TestGeneralUtils:
         # assert the new default
         assert datetimes[0] == DT_PLACEHOLDER
         assert datetimes[1] == DT_PLACEHOLDER
+
+    def test_get_waf_datetimes_flexible_parsing(self):
+        """Test flexible datetime parsing with dateutil handles format variations."""
+        # Apache format with extra spaces
+        page_apache_variation = """<html><body><pre>
+<a href="file1.xml">file1.xml</a>    2025-01-22  14:30    10K
+<a href="file2.xml">file2.xml</a>    2026-07-12   02:23   15K
+</pre></body></html>"""
+
+        soup = BeautifulSoup(page_apache_variation, "html.parser")
+        datetimes = get_waf_datetimes(soup, 2)
+
+        assert datetimes == [
+            datetime(2025, 1, 22, 14, 30),
+            datetime(2026, 7, 12, 2, 23),
+        ]
+
+        # Nginx format - month abbreviation
+        page_nginx = """<html><body><pre>
+<a href="file1.xml">file1.xml</a>    02-Oct-2025 11:47    10K
+<a href="file2.xml">file2.xml</a>    15-Dec-2026  09:30   15K
+</pre></body></html>"""
+
+        soup = BeautifulSoup(page_nginx, "html.parser")
+        datetimes = get_waf_datetimes(soup, 2)
+
+        assert datetimes == [
+            datetime(2025, 10, 2, 11, 47),
+            datetime(2026, 12, 15, 9, 30),
+        ]
+
+        # BTS long format - full day and month names
+        page_bts = """<html><body><pre>
+<a href="file1.xml">file1.xml</a>    Friday, July 31, 2026  4:53 PM    10K
+<a href="file2.xml">file2.xml</a>    Monday, January 5, 2025 10:30 AM  15K
+</pre></body></html>"""
+
+        soup = BeautifulSoup(page_bts, "html.parser")
+        datetimes = get_waf_datetimes(soup, 2)
+
+        assert datetimes == [
+            datetime(2026, 7, 31, 16, 53),
+            datetime(2025, 1, 5, 10, 30),
+        ]
 
     def test_assemble_validation_messages(
         self, dol_distribution_json, dcatus_non_federal_schema
@@ -361,6 +802,284 @@ class TestGeneralUtils:
         )
         keyword_error = next(e for e in errors if "$.keyword" in e.message)
         assert "max 1000 items" in keyword_error.message
+
+    def test_assemble_validation_messages_type_error_list_value_is_reported(
+        self, dcatus3_complete_example
+    ):
+        """A non-empty list that fails `type: ["null", "string"]` must be
+        reported, not dropped."""
+        dcatus3_complete_example["spatialResolutionInMeters"] = ["bad"]
+
+        errors = assemble_validation_errors(
+            DCATUS3_DATASET_VALIDATOR.iter_errors(dcatus3_complete_example)
+        )
+
+        assert len(errors) == 1
+        assert errors[0].message == (
+            "$.spatialResolutionInMeters, array value does not match any "
+            "of the acceptable formats: 'string'"
+        )
+
+    def test_assemble_validation_messages_type_error_dict_value_is_reported(
+        self, dcatus3_complete_example
+    ):
+        """Same as the list case; name the offender as "object value", not a
+        dict key."""
+        dcatus3_complete_example["temporalResolution"] = {"a": 1}
+
+        errors = assemble_validation_errors(
+            DCATUS3_DATASET_VALIDATOR.iter_errors(dcatus3_complete_example)
+        )
+
+        assert len(errors) == 1
+        assert errors[0].message == (
+            "$.temporalResolution, object value does not match any of the "
+            "acceptable formats: 'string'"
+        )
+
+    def test_assemble_validation_messages_type_error_single_type_leaf_is_reported(
+        self, dcatus3_complete_example
+    ):
+        """A leaf `type: string` error with no parent (nested `@type`) must
+        still be reported."""
+        dcatus3_complete_example["distribution"][0]["@type"] = {"a": 1}
+
+        errors = assemble_validation_errors(
+            DCATUS3_DATASET_VALIDATOR.iter_errors(dcatus3_complete_example)
+        )
+
+        assert len(errors) == 1
+        assert errors[0].message == (
+            "$.distribution[0]['@type'], object value does not match any of "
+            "the acceptable formats: 'string'"
+        )
+
+        dcatus3_complete_example["distribution"][0]["@type"] = ["a"]
+
+        errors = assemble_validation_errors(
+            DCATUS3_DATASET_VALIDATOR.iter_errors(dcatus3_complete_example)
+        )
+
+        assert len(errors) == 1
+        assert errors[0].message == (
+            "$.distribution[0]['@type'], array value does not match any of "
+            "the acceptable formats: 'string'"
+        )
+
+    def test_assemble_validation_messages_anyof_context_still_finds_specific_cause(
+        self, dcatus3_complete_example
+    ):
+        """An anyOf failure should surface the specific cause, not the
+        null-branch type error."""
+        del dcatus3_complete_example["contactPoint"][0]["hasEmail"]
+
+        errors = assemble_validation_errors(
+            DCATUS3_DATASET_VALIDATOR.iter_errors(dcatus3_complete_example)
+        )
+
+        assert len(errors) == 1
+        assert (
+            errors[0].message == "$.contactPoint[0], 'hasEmail' is a required property"
+        )
+
+    def test_assemble_validation_messages_nested_container_type_error_under_anyof(
+        self, dcatus3_complete_example
+    ):
+        """A leaf type error reached through anyOf (deeper json_path than its
+        parent) must be reported."""
+        dcatus3_complete_example["contactPoint"][0]["@type"] = ["Kind"]
+
+        errors = assemble_validation_errors(
+            DCATUS3_DATASET_VALIDATOR.iter_errors(dcatus3_complete_example)
+        )
+
+        assert len(errors) == 1
+        assert errors[0].message == (
+            "$.contactPoint[0]['@type'], array value does not match any of "
+            "the acceptable formats: 'string'"
+        )
+
+    def test_assemble_validation_messages_plain_leaf_type_error_is_unaffected(
+        self, dcatus3_complete_example
+    ):
+        """A plain `type: string` leaf with no context is unchanged by the
+        forced fallback."""
+        dcatus3_complete_example["title"] = {"a": 1}
+
+        errors = assemble_validation_errors(
+            DCATUS3_DATASET_VALIDATOR.iter_errors(dcatus3_complete_example)
+        )
+
+        assert len(errors) == 1
+        assert errors[0].message == (
+            "$.title, object value does not match any of the acceptable "
+            "formats: 'string'"
+        )
+
+    def test_assemble_validation_messages_anyof_of_all_scalar_types_is_rescued(
+        self, dcatus3_complete_example
+    ):
+        """When every anyOf alternative is scalar, report a vague type error
+        rather than silence."""
+        dcatus3_complete_example["accessRights"] = ["x"]
+
+        errors = assemble_validation_errors(
+            DCATUS3_DATASET_VALIDATOR.iter_errors(dcatus3_complete_example)
+        )
+
+        assert len(errors) == 1
+        assert errors[0].message == (
+            "$.accessRights, array value does not match any of the "
+            "acceptable formats: 'null', 'string'"
+        )
+
+    def test_assemble_validation_messages_anyof_of_all_scalar_types_is_rescued_dict(
+        self, dcatus3_complete_example
+    ):
+        """Same all-scalar anyOf rescue, for a dict against `language`."""
+        dcatus3_complete_example["language"] = {"a": 1}
+
+        errors = assemble_validation_errors(
+            DCATUS3_DATASET_VALIDATOR.iter_errors(dcatus3_complete_example)
+        )
+
+        assert len(errors) == 1
+        assert errors[0].message == (
+            "$.language, object value does not match any of the acceptable "
+            "formats: 'null', 'string', 'array'"
+        )
+
+    def test_assemble_validation_messages_anyof_of_all_scalar_types_is_rescued_date(
+        self, dcatus3_complete_example
+    ):
+        """Same all-scalar anyOf rescue, for `created` (nested anyOf of date forms)."""
+        dcatus3_complete_example["created"] = ["2025"]
+
+        errors = assemble_validation_errors(
+            DCATUS3_DATASET_VALIDATOR.iter_errors(dcatus3_complete_example)
+        )
+
+        assert len(errors) == 1
+        assert errors[0].message == (
+            "$.created, array value does not match any of the acceptable "
+            "formats: 'string'"
+        )
+
+    def test_assemble_validation_messages_anyof_of_all_scalar_types_is_rescued_nested(
+        self, dcatus3_complete_example
+    ):
+        """Same all-scalar anyOf rescue, nested under `spatial[0].bbox`."""
+        dcatus3_complete_example["spatial"][0]["bbox"] = ["x"]
+
+        errors = assemble_validation_errors(
+            DCATUS3_DATASET_VALIDATOR.iter_errors(dcatus3_complete_example)
+        )
+
+        assert len(errors) == 1
+        assert errors[0].message == (
+            "$.spatial[0].bbox, array value does not match any of the "
+            "acceptable formats: 'null', 'string', 'object'"
+        )
+
+    def test_assemble_validation_messages_maxitems_numeric_array_does_not_crash(
+        self, dcatus3_complete_example
+    ):
+        """A numeric maxItems array must not crash message assembly; name it
+        as "array value"."""
+        dcatus3_complete_example["spatial"][0]["centroid"] = {
+            "type": "Point",
+            "coordinates": [-77, 38, 1],
+        }
+
+        errors = assemble_validation_errors(
+            DCATUS3_DATASET_VALIDATOR.iter_errors(dcatus3_complete_example)
+        )
+
+        assert len(errors) == 1
+        assert errors[0].message == (
+            "$.spatial[0].centroid.coordinates, array value does not match "
+            "any of the acceptable formats: max 2 items"
+        )
+
+    def test_assemble_validation_messages_minitems_names_specific_cause(
+        self, dcatus3_complete_example
+    ):
+        """A minItems violation must be reported at its own path, not as a
+        parent anyOf type error."""
+        dcatus3_complete_example["spatial"][0]["centroid"] = {
+            "type": "Point",
+            "coordinates": [-77],
+        }
+
+        errors = assemble_validation_errors(
+            DCATUS3_DATASET_VALIDATOR.iter_errors(dcatus3_complete_example)
+        )
+
+        assert len(errors) == 1
+        assert errors[0].message == (
+            "$.spatial[0].centroid.coordinates, array value does not match "
+            "any of the acceptable formats: min 2 items"
+        )
+
+    def test_assemble_validation_messages_formats_the_result_once(
+        self, dcatus3_complete_example
+    ):
+        """
+        Formatting on every recursive return repeated the same work and made the
+        assembler quadratic. (GSA/data.gov#6067)
+        """
+        dcatus3_complete_example["spatialResolutionInMeters"] = ["bad"]
+        del dcatus3_complete_example["title"]
+
+        with patch(
+            "dcatus_validation.messages.finalize_validation_messages",
+            wraps=messages.finalize_validation_messages,
+        ) as finalize:
+            errors = assemble_validation_errors(
+                DCATUS3_DATASET_VALIDATOR.iter_errors(dcatus3_complete_example)
+            )
+
+        # the input recurses through anyOf context, so this is >1 without the fix
+        assert finalize.call_count == 1
+        assert len(errors) == 2
+
+    def test_assemble_validation_messages_scales_linearly_with_dataset_count(self):
+        """
+        A 3.0 catalog is assembled in one call, so the message dict grew with the
+        dataset count and the per-error work grew with it, on a catalog well under
+        the upload limit. 27s before the fix, 0.02s after on a dev laptop. 2s is
+        deliberately loose: it catches the quadratic coming back, not a small
+        regression.
+        """
+        count = 4000
+        catalog = {
+            "@type": "Catalog",
+            "title": "Assembler scaling",
+            "description": "Every dataset is missing its identifier.",
+            "dataset": [
+                {
+                    "@type": "Dataset",
+                    "title": "Example Dataset",
+                    "description": "A dataset with no identifier.",
+                    "contactPoint": {
+                        "fn": "Support",
+                        "hasEmail": "mailto:support@example.gov",
+                    },
+                    "publisher": {"name": "Example Org"},
+                }
+                for _ in range(count)
+            ],
+        }
+        validator = build_dcatus3_validator(DCATUS3_DEFINITIONS_DIR)
+        validation_errors = list(validator.iter_errors(catalog))
+
+        start = time.perf_counter()
+        errors = assemble_validation_errors(iter(validation_errors))
+        elapsed = time.perf_counter() - start
+
+        # one "'identifier' is a required property" per dataset, all still found
+        assert len(errors) == count
+        assert elapsed < 2, f"assembling {count} errors took {elapsed:.1f}s"
 
     def test_find_indexes_for_duplicates(self):
         data = [
@@ -445,6 +1164,43 @@ class TestGeneralUtils:
             )
             == 1
         )
+
+    def test_facet_builder_enum_eq(self):
+        facets = HarvesterDBInterface.query_filter_builder(
+            HarvestSource, "schema_type eq dcatus1.1: non-federal"
+        )
+        assert len(facets) == 1
+        compiled = facets[0].compile(compile_kwargs={"literal_binds": True})
+        assert "CAST" not in str(compiled)
+
+    def test_facet_builder_enum_startswith(self):
+        facets = HarvesterDBInterface.query_filter_builder(
+            HarvestSource, "schema_type startswith_op dcat"
+        )
+        assert len(facets) == 1
+        compiled = str(facets[0].compile(compile_kwargs={"literal_binds": True}))
+        assert "CAST" in compiled
+        assert "LIKE" in compiled
+
+    @pytest.mark.parametrize(
+        "op",
+        [
+            "like_op",
+            "notlike_op",
+            "ilike_op",
+            "notilike_op",
+            "startswith_op",
+            "endswith_op",
+            "contains_op",
+        ],
+    )
+    def test_facet_builder_enum_text_pattern_operators(self, op):
+        facets = HarvesterDBInterface.query_filter_builder(
+            HarvestSource, f"schema_type {op} dcat"
+        )
+        assert len(facets) == 1
+        compiled = str(facets[0].compile(compile_kwargs={"literal_binds": True}))
+        assert "CAST" in compiled
 
     def test_facet_builder_multiple(self):
         assert (
@@ -698,6 +1454,167 @@ class TestGeneralUtils:
         "format" not in prepared_dcatus_doc["distribution"][-1]
 
 
+class TestSortDataset:
+    def test_sort_is_deterministic_regardless_of_key_and_list_order(self):
+        a = {
+            "identifier": "a",
+            "keyword": ["b", "a"],
+            "distribution": [{"title": "two"}, {"title": "one"}],
+        }
+        b = {
+            "distribution": [{"title": "one"}, {"title": "two"}],
+            "keyword": ["a", "b"],
+            "identifier": "a",
+        }
+
+        # dict equality ignores key order, but json.dumps (what harvest.py
+        # actually hashes) does not -- compare the serialized form so this
+        # test would fail if dict keys weren't also being sorted.
+        assert json.dumps(sort_dataset(a)) == json.dumps(sort_dataset(b))
+
+    def test_sort_handles_nested_dict_values_that_cannot_be_ordered(self):
+        """
+        regression test for https://github.com/GSA/data.gov/issues/5450
+
+        harvested records can carry vendor-specific fields (e.g. ArcGIS's
+        "metadata" field) whose list elements are dicts sharing a first key
+        with dict-valued, unequal values. python can't order dicts with
+        `<`/`>`, which crashed the third-party sansjson library this
+        function used to delegate to.
+        """
+        record = {
+            "identifier": "https://www.arcgis.com/home/item.html?id=bd1b6ee9",
+            "metadata": {
+                "mdContact": {"rpCntInfo": {"cntAddress": {"city": "Washington"}}},
+                "spatRepInfo": {"VectSpatRep": {"geometObjs": {"geoObjCnt": 5}}},
+            },
+            "fields": [
+                {"name": "A", "domain": {"codedValues": [{"code": "US"}]}},
+                {"name": "B", "domain": {"codedValues": [{"code": "CA"}]}},
+            ],
+        }
+
+        sorted_record = sort_dataset(record)  # should not raise
+
+        assert (
+            sorted_record["metadata"]["mdContact"]["rpCntInfo"]["cntAddress"]["city"]
+            == "Washington"
+        )
+        assert {f["name"] for f in sorted_record["fields"]} == {"A", "B"}
+
+    def test_sort_orders_dict_keys_alphabetically(self):
+        assert list(sort_dataset({"b": 1, "a": 2}).keys()) == ["a", "b"]
+
+    def test_sort_recurses_into_dict_elements_of_a_list(self):
+        record = {"distribution": [{"z": 1, "a": 2}]}
+
+        assert list(sort_dataset(record)["distribution"][0].keys()) == ["a", "z"]
+
+    def test_sort_orders_numeric_lists_by_value_not_json_string(self):
+        # "10" sorts before "2" as a json/string value, but should not here
+        assert sort_dataset([2, 10, 1]) == [1, 2, 10]
+
+    def test_sort_orders_string_lists_naturally(self):
+        # a naive `key=lambda i: json.dumps(i)` sorts "food safety" before
+        # "food", because a quote (0x22) sorts after a space (0x20) --
+        # breaking hash stability for the common "keyword"/"keyword extra"
+        # pattern in harvested keyword lists.
+        assert sort_dataset(["food safety", "food", "foodborne"]) == [
+            "food",
+            "food safety",
+            "foodborne",
+        ]
+
+    def test_sort_does_not_reorder_a_linestring(self):
+        """
+        an array of arrays is positional geometry, not an unordered
+        collection -- reordering it moves vertices. this is the depth-2
+        shape `spatial.coordinates` takes for a GeoJSON LineString, which
+        federal_dataset.json permits as "array of array of number".
+        """
+        line = [[10.0, 1.0], [2.0, 3.0], [-5.0, 4.0]]
+
+        assert sort_dataset({"coordinates": line})["coordinates"] == line
+
+    def test_sort_keeps_a_polygon_ring_closed(self):
+        ring = [
+            [-77.119759, 38.791645],
+            [-76.909393, 38.791645],
+            [-76.909393, 38.99538],
+            [-77.119759, 38.99538],
+            [-77.119759, 38.791645],
+        ]
+
+        sorted_ring = sort_dataset({"coordinates": [ring]})["coordinates"][0]
+
+        assert sorted_ring == ring
+        assert sorted_ring[0] == sorted_ring[-1], "ring must stay closed"
+
+    def test_sort_canonicalizes_dict_keys_inside_a_nested_list(self):
+        """
+        preserving a positional list's element order must not stop dict keys
+        nested inside it from being canonicalized -- otherwise that subtree
+        hashes differently depending on source key order, defeating the
+        point of the function.
+        """
+        a = sort_dataset({"x": [[{"z": 1, "a": 2}]]})
+        b = sort_dataset({"x": [[{"a": 2, "z": 1}]]})
+
+        assert json.dumps(a) == json.dumps(b)
+        assert list(a["x"][0][0].keys()) == ["a", "z"]
+
+    @pytest.mark.parametrize(
+        "elements",
+        [
+            # `isinstance(True, int)` is True in python, so a bool must be
+            # ranked before the numeric check -- otherwise True and 1 compare
+            # equal, the sort is left to input order, and the same content
+            # hashes two different ways.
+            [True, 1],
+            [False, 0],
+            # a list mixing every json type must not attempt an unsupported
+            # comparison between types, and must land in one stable order
+            [None, 3, "a", True, 1.5, {"x": 1}, [1, 2]],
+        ],
+    )
+    def test_sort_of_mixed_type_list_is_stable_across_input_orders(self, elements):
+        outputs = {
+            json.dumps(sort_dataset(list(permutation)))
+            for permutation in itertools.permutations(elements)
+        }
+
+        assert len(outputs) == 1, f"ordering depends on input order: {outputs}"
+
+    def test_canonical_form_is_pinned(self):
+        """
+        the absolute canonical form, not just its stability. every stored
+        source_hash depends on it, so a change to the sort key or type ranks
+        silently invalidates every hash in the database -- this pins the
+        output so that change has to be deliberate.
+        """
+        record = {
+            "identifier": "golden",
+            "keyword": ["b", "a and more", "a"],
+            "distribution": [{"title": "two", "x": 1}, {"title": "one"}],
+            "spatial": {
+                "type": "LineString",
+                "coordinates": [[10.0, 1.0], [2.0, 3.0]],
+            },
+            # one of every json type, so the relative order of the type
+            # ranks is pinned too, not just the values within a rank
+            "mixed": [None, 3, "a", True, 1.5, {"k": 1}, [1, 2]],
+        }
+
+        assert json.dumps(sort_dataset(record)) == (
+            '{"distribution": [{"title": "one"}, {"title": "two", "x": 1}], '
+            '"identifier": "golden", '
+            '"keyword": ["a", "a and more", "b"], '
+            '"mixed": [null, true, 1.5, 3, "a", [1, 2], {"k": 1}], '
+            '"spatial": {"coordinates": [[10.0, 1.0], [2.0, 3.0]], '
+            '"type": "LineString"}}'
+        )
+
+
 class TestDcatus3Catalog:
     def test_strip_dcatus3_catalog_objects_removes_harvested_fields(self):
         catalog = {
@@ -905,6 +1822,80 @@ class TestBackfillCatalogRecordIdentifiers:
         assert "@id" not in records[0]
 
 
+class TestResolveObjectIdentifier:
+    def test_missing_identifier_gets_resolved_from_title(self):
+        records = [{"title": "Data Service Without Identifier"}]
+
+        result = resolve_object_identifier(records)
+
+        assert result[0][RESOLVED_IDENTIFIER_KEY] == "data-service-without-identifier"
+
+    def test_does_not_write_into_identifier_or_atid(self):
+        """The resolved value is bookkeeping-only; the record a provider
+        sent us must never be altered -- see GSA/data.gov#6431."""
+        records = [{"title": "Data Service Without Identifier"}]
+
+        result = resolve_object_identifier(records)
+
+        assert "identifier" not in result[0]
+        assert "@id" not in result[0]
+
+    def test_existing_identifier_is_resolved_value(self):
+        records = [{"identifier": "https://example.gov/svc-1", "title": "Service One"}]
+
+        result = resolve_object_identifier(records)
+
+        assert result[0][RESOLVED_IDENTIFIER_KEY] == "https://example.gov/svc-1"
+        assert result[0]["identifier"] == "https://example.gov/svc-1"
+
+    def test_falls_back_to_atid_before_title(self):
+        """A provider's object may carry an "@id" even though its
+        "identifier" field is missing; prefer that over munging the title."""
+        records = [{"@id": "https://example.gov/svc-1", "title": "Service One"}]
+
+        result = resolve_object_identifier(records)
+
+        assert result[0][RESOLVED_IDENTIFIER_KEY] == "https://example.gov/svc-1"
+
+    def test_plain_identifier_is_used_as_is_for_bookkeeping(self):
+        """A DatasetSeries missing "@id" but carrying a plain alphanumeric
+        "identifier" (e.g. SSA's "US-GOV-SSA-3379") gets that value as its
+        bookkeeping identifier -- no IRI-format concern, since this value
+        is never written into "@id" or the record otherwise. See
+        GSA/data.gov#6431."""
+        records = [{"identifier": "US-GOV-SSA-3379", "title": "National Series"}]
+
+        result = resolve_object_identifier(records)
+
+        assert result[0][RESOLVED_IDENTIFIER_KEY] == "US-GOV-SSA-3379"
+        assert "@id" not in result[0]
+
+    def test_resolved_id_is_stable_for_same_title(self):
+        records = [{"title": "Dataset Series Without An Id"}]
+
+        first = resolve_object_identifier(records)[0][RESOLVED_IDENTIFIER_KEY]
+        second = resolve_object_identifier(records)[0][RESOLVED_IDENTIFIER_KEY]
+
+        assert first == second
+
+    def test_resolved_id_differs_for_different_title(self):
+        a = resolve_object_identifier([{"title": "Series A"}])[0][
+            RESOLVED_IDENTIFIER_KEY
+        ]
+        b = resolve_object_identifier([{"title": "Series B"}])[0][
+            RESOLVED_IDENTIFIER_KEY
+        ]
+
+        assert a != b
+
+    def test_does_not_mutate_input(self):
+        records = [{"title": "Dataset Series Without An Id"}]
+
+        resolve_object_identifier(records)
+
+        assert RESOLVED_IDENTIFIER_KEY not in records[0]
+
+
 class TestExtractDcatus3NestedDatasets:
     def test_uses_custom_parent_identifier_field(self):
         """DatasetSeries (like CatalogRecord) has no "identifier" field,
@@ -963,6 +1954,26 @@ class TestExtractDcatus3NestedDatasets:
         parents = [{"identifier": "svc-1"}]
 
         assert extract_dcatus3_nested_datasets(parents, "servesDataset") == []
+
+    def test_prefers_resolved_identifier_over_parent_identifier_field(self):
+        """A parent run through resolve_object_identifier carries its
+        bookkeeping identifier under RESOLVED_IDENTIFIER_KEY; that value
+        must win over parent_identifier_field so children stay linked to
+        the series/service even when it has no real "identifier"/"@id"."""
+        parents = [
+            {
+                RESOLVED_IDENTIFIER_KEY: "resolved-series-1",
+                "seriesMember": [{"identifier": "ds-1"}],
+            }
+        ]
+
+        result = extract_dcatus3_nested_datasets(
+            parents, "seriesMember", parent_identifier_field="@id"
+        )
+
+        assert result == [
+            {"identifier": "ds-1", "parent_identifier": "resolved-series-1"}
+        ]
 
     def test_multiple_parents_each_tagged_with_their_own_identifier(self):
         parents = [

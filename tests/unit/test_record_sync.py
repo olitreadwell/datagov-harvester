@@ -72,3 +72,65 @@ class TestRecordSyncStatus:
 
         assert result is True
         assert mock_record._status == "success"
+
+
+def test_iso_dataset_payload_meridian():
+
+    record = Record.__new__(Record)
+    record._harvest_source = MagicMock(
+        organization_id="a", schema_type="iso19115_1", id="b"
+    )
+    record._record_type = "dataset"
+    record._identifier = "test-id"
+    record._dataset_slug = "test-slug"
+    record._id = "record-123"
+    record._date_finished = "test datetime"
+
+    res = record._dataset_payload(
+        {"spatial": "179.77847,-14.548699,-179.146711,71.387815"}
+    )
+
+    assert res["translated_spatial"] == {
+        "type": "MultiPolygon",
+        "coordinates": [
+            [
+                [
+                    [179.77847, -14.548699],
+                    [180.0, -14.548699],
+                    [180.0, 71.387815],
+                    [179.77847, 71.387815],
+                    [179.77847, -14.548699],
+                ]
+            ],
+            [
+                [
+                    [-180.0, 71.387815],
+                    [-180.0, -14.548699],
+                    [-179.146711, -14.548699],
+                    [-179.146711, 71.387815],
+                    [-180.0, 71.387815],
+                ]
+            ],
+        ],
+    }
+
+
+def test_dataset_payload_clears_translated_spatial_when_spatial_removed():
+    """translated_spatial must be explicitly set to None (not omitted) when the
+    incoming record has no spatial value, so the upsert clears any stale
+    geometry from a prior harvest instead of leaving it untouched."""
+
+    record = Record.__new__(Record)
+    record._harvest_source = MagicMock(
+        organization_id="a", schema_type="dcatus1.1: federal", id="b"
+    )
+    record._record_type = "dataset"
+    record._identifier = "test-id"
+    record._dataset_slug = "test-slug"
+    record._id = "record-123"
+    record._date_finished = "test datetime"
+
+    res = record._dataset_payload({"title": "Test"})
+
+    assert "translated_spatial" in res
+    assert res["translated_spatial"] is None

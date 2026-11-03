@@ -9,6 +9,7 @@ MAPPINGS = {
         },
         "slug": {"type": "keyword"},
         "type": {"type": "keyword"},
+        "parent_identifier": {"type": "keyword"},
         "last_harvested_date": {"type": "date"},
         "dcat": {
             "type": "nested",
@@ -36,6 +37,7 @@ MAPPINGS = {
                 },
             },
         },
+        "access_level": {"type": "keyword"},
         "keyword": {
             "type": "text",
             "analyzer": TEXT_ANALYZER,
@@ -52,6 +54,12 @@ MAPPINGS = {
             "type": "text",
             "analyzer": TEXT_ANALYZER,
             "search_analyzer": TEXT_ANALYZER,
+            "fields": {
+                "normalized": {
+                    "type": "keyword",
+                    "normalizer": KEYWORD_NORMALIZER,  # simple lowercase normalizer
+                },
+            },
         },
         "identifier": {
             "type": "text",

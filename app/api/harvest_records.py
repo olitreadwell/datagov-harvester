@@ -3,10 +3,13 @@ import json
 from flask import Response, jsonify, make_response, request
 
 from app import deps
-from app.api_schemas import ErrorInfo, RecordInfo
+from app.api_schemas import ErrorInfo, RecordInfo, RecordIssueQuery
 from app.deps import (
+    JSON_INVALID_SEVERITY,
     JSON_NOT_FOUND,
+    InvalidSeverityError,
     _log_mutation,
+    get_requested_severity,
     logger,
     login_required,
     valid_id_required,
@@ -27,12 +30,13 @@ def get_harvest_record(record_id):
 @api.doc(
     responses={
         200: {
-            "description": "Raw harvest record contents",
+            "description": "Raw source metadata as originally harvested",
             "content": {
-                "application/json": {"type": "object"},
-                "application/xml": {"type": "object"},
+                "application/json": {"schema": {"type": "object"}},
+                "application/xml": {"schema": {"type": "object"}},
             },
-        }
+        },
+        404: {"description": "Record not found"},
     }
 )
 @valid_id_required
@@ -65,11 +69,12 @@ def get_harvest_record_raw(record_id=None):
 @api.doc(
     responses={
         200: {
-            "description": "Transformed harvest record contents",
+            "description": "Transformed DCAT-US metadata",
             "content": {
-                "application/json": {"type": "object"},
+                "application/json": {"schema": {"type": "object"}},
             },
-        }
+        },
+        404: {"description": "Record not found"},
     }
 )
 @valid_id_required
@@ -127,9 +132,27 @@ def add_harvest_record():
     }
 )
 @valid_id_required
-def get_all_harvest_record_errors(record_id: str) -> list:
+# below valid_id_required on purpose: that decorator asserts every argument is a
+# UUID, so the injected query dict has to arrive after it has run, not before.
+@api.input(RecordIssueQuery, location="query", validation=False)
+def get_all_harvest_record_errors(record_id: str, **kwargs) -> list:
+    """List issues for a record.
+
+    Accepts an optional `severity` query param ("error" or "warning"). With no
+    param every issue is returned, matching the job-level reads (#799); the
+    severity of each row is in the response. The interface function still
+    defaults to "error", so None is passed explicitly.
+    """
+    # validated outside the try below so the 400 isn't swallowed as a 404
     try:
-        record_errors = deps.db.get_harvest_record_errors_by_record(record_id)
+        severity = get_requested_severity(default=None)
+    except InvalidSeverityError:
+        return JSON_INVALID_SEVERITY()
+
+    try:
+        record_errors = deps.db.get_harvest_record_errors_by_record(
+            record_id, severity=severity
+        )
         return (
             jsonify(deps.db._to_dict(record_errors))
             if record_errors
@@ -145,6 +168,10 @@ def get_all_harvest_record_errors(record_id: str) -> list:
 def get_harvest_error(error_id: str = None) -> Response:
     try:
         error = deps.db.get_harvest_error(error_id)
-        return jsonify(deps.db._to_dict(error)) if error else JSON_NOT_FOUND()
+        if not error:
+            return JSON_NOT_FOUND()
+        error_dict = deps.db._to_dict(error)
+        error_dict.setdefault("harvest_job_id", None)
+        return jsonify(error_dict)
     except Exception:
         return jsonify({"error": "Please provide a valid record_id"}), 404

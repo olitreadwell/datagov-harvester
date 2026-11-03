@@ -1,4 +1,5 @@
 import argparse
+import ast
 import hashlib
 import http
 import json
@@ -9,7 +10,7 @@ import re
 import smtplib
 import time
 import uuid
-from collections import defaultdict
+import warnings
 from datetime import datetime, timedelta, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -19,21 +20,19 @@ from uuid import UUID
 
 import geojson_validator
 import requests
-import sansjson
+import shapely.wkt
 from bs4 import BeautifulSoup
-from bs4.element import Tag
-from jsonschema import Draft202012Validator, FormatChecker
-from jsonschema.exceptions import ValidationError
-from referencing import Registry
-from referencing.jsonschema import DRAFT202012
+from dateutil import parser as dateutil_parser
+from dateutil.parser import ParserError
+from shapely.geometry import LineString, Point
+from shapely.geometry import mapping as shapely_geom_mapping
+
+from dcatus_validation.fetch import USER_AGENT
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger()
 
 FREQUENCY_ENUM = {"daily": 1, "weekly": 7, "biweekly": 14, "monthly": 30}
-
-# User-Agent header for all HTTP requests
-USER_AGENT = "HarvesterBot/0.0 (https://data.gov; datagovhelp@gsa.gov) Data.gov/2.0"
 
 DT_PLACEHOLDER = datetime.now()
 
@@ -50,6 +49,8 @@ SMTP_CONFIG = {
     "base_url": os.getenv("REDIRECT_URI").rsplit("/", 1)[0],
     "recipient": os.getenv("HARVEST_SMTP_RECIPIENT"),
 }
+
+CATALOG_BASE_URL = os.getenv("CATALOG_BASE_URL") or ""
 
 RESOURCE_MAPPING = {
     # ArcGIS File Types
@@ -296,6 +297,26 @@ URL_RESOURCE_MAPPING = {
     "arcgis_rest": ("arcgis/rest/services",),
 }
 
+# geojson validator criteria
+INVALID_CRITERIA = [
+    "unclosed",
+    "less_three_unique_nodes",
+    "exterior_not_ccw",
+    "interior_not_cw",
+]
+
+PROBLEMATIC_CRITERIA = [
+    "holes",
+    "inner_and_exterior_ring_intersect",
+    "self_intersection",
+    "duplicate_nodes",
+    # "excessive_coordinate_precision",  # ignore
+    "excessive_vertices",
+    "3d_coordinates",
+    "outside_lat_lon_boundaries",
+    "crosses_antimeridian",
+]
+
 
 def add_landing_page_as_distribution(dcatus_doc: dict) -> dict:
     """
@@ -406,22 +427,69 @@ def convert_set_to_list(obj):
     raise TypeError
 
 
+def _sort_dataset_list_item_key(item):
+    """type-ranked sort key for an element of a list being canonicalized by
+    sort_dataset, so elements are never compared to each other directly with
+    python's `<`/`>` -- which raises for dicts, and for a list containing
+    a mix of types (e.g. str and int).
+
+    ranks put same-typed values through their natural ordering (so e.g.
+    string lists sort the same way python's default `sorted()` would,
+    rather than by their quoted json representation, which would sort
+    "food" after "food safety" because '"' > ' ').
+    """
+    if item is None:
+        return (0,)
+    if isinstance(item, bool):
+        return (1, item)
+    if isinstance(item, (int, float)):
+        return (2, item)
+    if isinstance(item, str):
+        return (3, item)
+    if isinstance(item, list):
+        return (4, json.dumps(item, sort_keys=True))
+    return (5, json.dumps(item, sort_keys=True))  # dict
+
+
+def _canonicalize_dict_keys(d):
+    """sort dict keys recursively without reordering any list, for the parts
+    of a record whose list order carries meaning.
+    """
+    if isinstance(d, dict):
+        return {k: _canonicalize_dict_keys(d[k]) for k in sorted(d.keys())}
+    if isinstance(d, list):
+        return [_canonicalize_dict_keys(item) for item in d]
+    return d
+
+
 def sort_dataset(d):
-    return sansjson.sort_pyobject(d)
+    """recursively canonicalize a record's ordering so semantically identical
+    records hash the same regardless of the order the source emits dict keys
+    and list elements in.
+
+    dict keys are always sorted. list elements are reordered only when the
+    list looks like an unordered collection: an array whose elements are all
+    arrays is treated as positional data (e.g. a GeoJSON ring or LineString,
+    where reordering would move vertices and break the geometry), so its
+    element order is preserved while dict keys nested inside it are still
+    sorted.
+    """
+    if isinstance(d, dict):
+        return {k: sort_dataset(d[k]) for k in sorted(d.keys())}
+    if isinstance(d, list):
+        if d and all(isinstance(item, list) for item in d):
+            return [_canonicalize_dict_keys(item) for item in d]
+        return sorted(
+            (sort_dataset(item) for item in d),
+            key=_sort_dataset_list_item_key,
+        )
+    return d
 
 
 def dataset_to_hash(d):
     # TODO: check for sh1 or sha256?
     # https://github.com/GSA/ckanext-datajson/blob/a3bc214fa7585115b9ff911b105884ef209aa416/ckanext/datajson/datajson.py#L279
     return hashlib.sha256(json.dumps(d, sort_keys=True).encode("utf-8")).hexdigest()
-
-
-def open_json(file_path):
-    """open input json file as dictionary
-    file_path (str)     :   json file path.
-    """
-    with open(file_path) as fp:
-        return json.load(fp)
 
 
 def download_file(url: str, file_type: str) -> Union[str, dict]:
@@ -528,6 +596,35 @@ def backfill_catalog_record_identifiers(records: list) -> list:
     return backfilled
 
 
+RESOLVED_IDENTIFIER_KEY = "_resolved_identifier"
+
+
+def resolve_object_identifier(records: list) -> list:
+    """
+    DataService's "identifier" and DatasetSeries's "@id" are both optional
+    per the DCAT-US3.0 schema. Resolve each record's own identifier --
+    preferring "identifier", then "@id", then a slug munged from its title
+    (required by both schemas) -- so harvester can still track the object
+    and link its child datasets to it.
+
+    This is for harvester's own bookkeeping only: the resolved value is
+    stashed under RESOLVED_IDENTIFIER_KEY, never written into "identifier"
+    or "@id" themselves. The record we validate, persist, and index must
+    stay exactly what the provider sent us -- see GSA/data.gov#6431.
+    """
+    resolved_records = []
+    for record in records:
+        record = dict(record)
+        resolved = (
+            normalize_dataset_identifier(record.get("identifier"))
+            or normalize_dataset_identifier(record.get("@id"))
+            or munge_title_to_name(str(record.get("title")))
+        )
+        record[RESOLVED_IDENTIFIER_KEY] = resolved
+        resolved_records.append(record)
+    return resolved_records
+
+
 def extract_dcatus3_catalog_dataset_series(catalog: dict) -> list:
     """
     recursively collect every DatasetSeries from a DCAT-US3 Catalog dict,
@@ -547,6 +644,11 @@ def extract_dcatus3_nested_datasets(
     field selects which key on the parent holds its own identifier, since
     DatasetSeries and CatalogRecord use "@id" instead of "identifier".
 
+    If a parent carries RESOLVED_IDENTIFIER_KEY (see resolve_object_identifier),
+    that bookkeeping value is used instead of parent_identifier_field directly,
+    so a child's parent_identifier always matches the parent's own tracked
+    identifier even when the parent's "identifier"/"@id" is missing.
+
     The same dataset can appear in more than one of [fields] on the same
     parent (e.g. a series's "first" usually also appears in "seriesMember").
     That's redundant source data, so each parent contributes one copy per
@@ -556,8 +658,8 @@ def extract_dcatus3_nested_datasets(
 
     for parent in parents:
         parent_identifier = normalize_dataset_identifier(
-            parent.get(parent_identifier_field)
-        )
+            parent.get(RESOLVED_IDENTIFIER_KEY)
+        ) or normalize_dataset_identifier(parent.get(parent_identifier_field))
         seen_identifiers = set()
         for field in fields:
             value = parent.get(field)
@@ -683,7 +785,9 @@ def find_indexes_for_duplicates(records: list, identifier_field: str = "identifi
     seen = set()
     output = []
     for i in range(len(records)):
-        identifier = normalize_dataset_identifier(records[i].get(identifier_field))
+        identifier = normalize_dataset_identifier(
+            records[i].get(RESOLVED_IDENTIFIER_KEY)
+        ) or normalize_dataset_identifier(records[i].get(identifier_field))
         if identifier in seen:
             output.append(i)
         seen.add(identifier)
@@ -693,41 +797,56 @@ def find_indexes_for_duplicates(records: list, identifier_field: str = "identifi
 
 
 def get_waf_datetimes(soup: BeautifulSoup, expected_length: int) -> list:
-    """
-    gets the datetime strings as datetime obejct of the waf datasets
-    """
-    output = []
+    """Return each WAF XML link's modification time in link order.
 
-    dt_data = [
-        [r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}", "%Y-%m-%d %H:%M"],
-        [r"\d{2}-[A-Za-z]{3}-\d{4}\s\d{2}:\d{2}", "%d-%b-%Y %H:%M"],
-        [r"\d{1,2}/\d{1,2}/\d{4}\s+\d{1,2}:\d{2}\s(?:AM|PM)", "%m/%d/%Y %I:%M %p"],
+    Extracts datetime strings and uses python-dateutil to parse them flexibly.
+    Based on ckanext-spatial approach: extract string, then dateutil.parser.parse().
+    """
+    anchors = [
+        anchor
+        for anchor in soup.find_all("a", href=True)
+        if anchor["href"].endswith(".xml")
     ]
-    rows = soup.find_all("td") or soup.find_all("pre")
+    output = []
+    parsed_count = 0
 
-    if rows and rows[0].name == "pre":
-        rows = rows[0].text.split(".xml")
+    for anchor in anchors:
+        table_row = anchor.find_parent("tr")
+        date_text = (
+            table_row.get_text(" ", strip=True)
+            if table_row is not None
+            else f"{anchor.next_sibling or ''} {anchor.previous_sibling or ''}"
+        )
+        modified_date = None
 
-    for row in rows:
-        if isinstance(row, Tag):
-            row = row.text
-        for dt_pattern, dt_format in dt_data:
-            res = re.search(dt_pattern, row)
-            if res is not None:
-                output.append(datetime.strptime(res.group(0), dt_format))
+        if date_text:
+            try:
+                date_candidates = re.findall(
+                    r"(?:\d{1,4}[-/]\d{1,2}[-/]\d{1,4}|\d{1,2}-[A-Za-z]{3}-\d{4}|"
+                    r"[A-Za-z]+,?\s+[A-Za-z]+\s+\d{1,2},?\s+\d{4})"
+                    r"\s+\d{1,2}:\d{2}(?:\s*(?:AM|PM))?",
+                    date_text,
+                )
 
-    if len(output) != expected_length:
+                if date_candidates:
+                    modified_date = dateutil_parser.parse(
+                        date_candidates[0], default=datetime(1900, 1, 1)
+                    )
+                    parsed_count += 1
+            except (ValueError, TypeError, ParserError, OverflowError):
+                pass
+
+        output.append(modified_date or DT_PLACEHOLDER)
+
+    if len(anchors) != expected_length or parsed_count != expected_length:
         logger.warning(
-            f"mismatching datetime ({len(output)}) and file ({expected_length} counts"
+            "Mismatching WAF datetimes (%s parsed) and files (%s expected)",
+            parsed_count,
+            expected_length,
         )
 
-    # pad with placeholder when more files than datetimes
     output += [DT_PLACEHOLDER] * (expected_length - len(output))
-
-    # when more datetimes than files
-    output = output[:expected_length]
-
-    return output
+    return output[:expected_length]
 
 
 def traverse_waf(
@@ -811,8 +930,22 @@ def is_number(s):
 
 # Find if a line between 2 x coordinates would cross the meridian
 def crosses_meridian(val1, val2):
+    """
+    checks if the 2 values cross the anti-meridian
+
+    this function is only called under the condition that geojson-validator
+    identified the geometry as "crosses_antimeridian" so something like
+    abs(-160-40) > 180 shouldn't happen.
+    """
+
+    # A jump greater than 180 degrees means the edge crosses
+    # the antimeridian while both coordinates are already normalized.
+    if abs(val1 - val2) > 180:
+        return True, val1 < 0
+
     longs = [val1, val2]
     longs.sort()
+
     if longs[1] > 180 and longs[0] <= 180:
         return True, val1 - val2 > 0
     if longs[0] < -180 and longs[1] >= -180:
@@ -832,6 +965,19 @@ def fix_longitude(val):
     if val < -180:
         return fix_longitude(val + 360)
     return val
+
+
+def ensure_counter_clockwise(points: list[list]):
+    """
+    the input points represent the external ring of a polygon.
+    geojson requires external rings to be counterclockwise.
+    """
+    area = sum(x1 * y2 - x2 * y1 for (x1, y1), (x2, y2) in zip(points, points[1:]))
+
+    if area < 0:
+        points.reverse()
+
+    return points
 
 
 # https://www.rfc-editor.org/rfc/rfc7946#section-3.1.9
@@ -866,6 +1012,10 @@ def spatial_wrap_around_meridian(geom):
                 longs = [-180.0, 180.0]
             # Calculate the distance longitude between the 2 points
             x_dist = abs(coord[0] - point_list[i + 1][0])
+
+            if x_dist > 180:
+                x_dist = 360 - x_dist
+
             # Calculate the percentage of the longitude to the meridian
             x_perc = abs(abs(new_long) - 180.0) / x_dist
             # Calculate the height at the meridian
@@ -883,7 +1033,9 @@ def spatial_wrap_around_meridian(geom):
                 )
             polygon_num = (polygon_num + 1) % 2
             # Start the next polygon at the same point, just on the other side.
-            new_geom["coordinates"][0][polygon_num].append([longs[1], coord[1]])
+            new_geom["coordinates"][0][polygon_num].append(
+                [longs[1], height_at_meridian]
+            )
         # If not, continue to add to the current polygon
         else:
             new_geom["coordinates"][0][polygon_num].append(
@@ -891,13 +1043,21 @@ def spatial_wrap_around_meridian(geom):
             )
     # Unclear why this is needed, but to work with the right hand rule.
     # https://medium.com/@jinagamvasubabu/solution-polygons-and-multipolygons-should-follow-the-right-hand-rule-27b96fa61c6
-    new_geom["coordinates"][0][1].reverse()
+    new_geom["coordinates"] = [
+        [ensure_counter_clockwise(new_geom["coordinates"][0][0])],
+        [ensure_counter_clockwise(new_geom["coordinates"][0][1])],
+    ]
+
     return new_geom
 
 
 def validate_geojson(geojson_str: str) -> bool:
     try:
-        res = geojson_validator.validate_geometries(json.loads(geojson_str))
+        res = geojson_validator.validate_geometries(
+            json.loads(geojson_str),
+            criteria_invalid=INVALID_CRITERIA,
+            criteria_problematic=PROBLEMATIC_CRITERIA,
+        )
         # If the geometry is valid, return the string
         if res.get("invalid") == {} and res.get("problematic") == {}:
             return geojson_str
@@ -923,7 +1083,11 @@ def validate_geojson(geojson_str: str) -> bool:
             geojson["coordinates"] = geojson["coordinates"][0]
         fixed_geom = geojson_validator.fix_geometries(geojson)
         fixed_geom = fixed_geom.get("features")[0].get("geometry")
-        res = geojson_validator.validate_geometries(fixed_geom)
+        res = geojson_validator.validate_geometries(
+            fixed_geom,
+            criteria_invalid=INVALID_CRITERIA,
+            criteria_problematic=PROBLEMATIC_CRITERIA,
+        )
         if res.get("invalid") == {} and res.get("problematic") == {}:
             return json.dumps(fixed_geom)
         elif (
@@ -1062,6 +1226,55 @@ def add_uuid_to_package_name(name: str) -> str:
     return f"{name}-{str(uuid.uuid4())[:5]}"
 
 
+_WKT_GEOMETRY_RE = re.compile(
+    r"^\s*(POINT|LINESTRING|POLYGON|MULTIPOINT|MULTILINESTRING|MULTIPOLYGON|"
+    r"GEOMETRYCOLLECTION)\s*(?:[ZM]{1,2}\s*)?\(",
+    re.IGNORECASE,
+)
+
+
+def _reduce_degenerate_polygon(geom):
+    """Collapse a zero-area Polygon exterior ring into a Point or LineString.
+
+    Coordinate rounding by some sources (e.g. bboxes rounded to 2 decimal
+    places for a small survey area) can collapse a Polygon's corners onto
+    each other or onto a line. shapely still parses these, but
+    geojson_validator's less_three_unique_nodes/exterior_not_ccw checks
+    reject them outright. munge_spatial already reduces this same situation
+    for v1.1 comma-separated bboxes, so mirror that here instead of losing
+    the geometry.
+    """
+    if geom.geom_type != "Polygon":
+        return geom
+
+    unique_coords = list(dict.fromkeys(geom.exterior.coords))
+    if len(unique_coords) == 1:
+        return Point(unique_coords[0])
+    if len(unique_coords) == 2:
+        return LineString(unique_coords)
+    return geom
+
+
+def translate_wkt_to_geojson(spatial_value: str) -> str:
+    """Convert a WKT geometry string into a GeoJSON string, if possible."""
+
+    if not _WKT_GEOMETRY_RE.match(spatial_value):
+        return ""
+
+    try:
+        geom = shapely.wkt.loads(spatial_value.strip())
+        # GeoJSON is 2D; drop any Z/M dimension rather than let the
+        # 3d_coordinates check in validate_geojson silently discard it.
+        geom = shapely.force_2d(geom)
+        geom = _reduce_degenerate_polygon(geom)
+        return json.dumps(shapely_geom_mapping(geom))
+    except:  # noqa: E722
+        logger.warning(
+            f"This spatial value looked like WKT but failed to parse: {spatial_value}"
+        )
+        return ""
+
+
 def munge_spatial(spatial_value: str) -> str:
     """Translate loose spatial inputs into GeoJSON strings when possible."""
 
@@ -1144,8 +1357,90 @@ def _get_geo_lookup_interface():
         return None
 
 
+def _unwrap_single_location(input_value):
+    """Resolve a single (non-array) spatial value to its geometry-bearing
+    value, or None if it has nothing usable.
+
+    When a Location defines more than one of these at once, bbox outranks
+    centroid outranks geometry (decided in #6297).
+    """
+
+    if (
+        isinstance(input_value, dict)
+        and not {
+            "type",
+            "coordinates",
+        }
+        <= input_value.keys()
+    ):
+        for field in ("bbox", "centroid", "geometry"):
+            value = input_value.get(field)
+            if value:
+                return value
+        return None
+
+    return input_value
+
+
+def _extract_label(input_value, field_name):
+    """Return a Location's `field_name` (prefLabel or altLabel) as a plain
+    string, or None if absent, blank, or not a dict.
+
+    Consulted by _unwrap_location only when nothing in the whole input has
+    usable geometry - real geometry always outranks a named-place fallback.
+    (Full hierarchy is geojson > delimited coords > named location; the
+    delimited-coords tier isn't implemented yet - translate_spatial's
+    existing validate_geojson -> get_geo_from_string -> munge_spatial order
+    is unchanged by this.)
+    """
+
+    if not isinstance(input_value, dict):
+        return None
+    label = input_value.get(field_name)
+    if isinstance(label, str) and label.strip():
+        return label
+    return None
+
+
+def _unwrap_location(input_value):
+    """Extract the geometry-bearing value from a DCAT-US 3.0 Location object.
+
+    v3.0 `spatial` is a Location object or a list of them; v1.1 is a plain
+    string. A bare {type, coordinates} GeoJSON dict is passed through.
+
+    Priority (decided in #6297) is bbox > centroid > geometry > prefLabel >
+    altLabel, first valid value wins:
+
+    Real geometry anywhere in the input always wins over a named-place
+    (prefLabel/altLabel) fallback found anywhere else: the first element
+    with usable geometry short-circuits the scan immediately. Only when NO
+    element has any geometry do we fall back to the first prefLabel seen
+    across the whole input, or - only if no element has a prefLabel either -
+    the first altLabel seen. The winning label is returned as a plain string
+    so it flows into translate_spatial's existing string branch (and from
+    there, its existing locations-table lookup) instead of being discarded.
+    """
+
+    items = input_value if isinstance(input_value, list) else [input_value]
+
+    for item in items:
+        unwrapped = _unwrap_single_location(item)
+        if unwrapped:
+            return unwrapped
+
+    for field_name in ("prefLabel", "altLabel"):
+        for item in items:
+            label = _extract_label(item, field_name)
+            if label:
+                return label
+
+    return None
+
+
 def translate_spatial(input_value) -> str:
     """Normalize spatial strings/dicts into GeoJSON strings when possible."""
+
+    input_value = _unwrap_location(input_value)
 
     if isinstance(input_value, dict):
         spatial_value = json.dumps(input_value)
@@ -1153,6 +1448,11 @@ def translate_spatial(input_value) -> str:
         spatial_value = input_value
     else:
         return ""
+
+    if isinstance(spatial_value, str):
+        wkt_geojson = translate_wkt_to_geojson(spatial_value)
+        if wkt_geojson:
+            spatial_value = wkt_geojson
 
     validated_geojson = validate_geojson(spatial_value)
     if validated_geojson:
@@ -1357,8 +1657,8 @@ def create_retry_session() -> RetrySession:
         return RetrySession(max_retries=0, backoff_factor=0)
 
 
-def send_email_to_recipients(recipients, subject, body):
-    """Send an email to a list of recipiencts.
+def send_email_to_recipients(recipients, subject, body, html_body=None):
+    """Send plain text and optional HTML versions to each recipient.
 
     The subject and body stay the same and it sends messages to each address
     in the iterable `recipients`.
@@ -1369,181 +1669,139 @@ def send_email_to_recipients(recipients, subject, body):
         server.login(SMTP_CONFIG["username"], SMTP_CONFIG["password"])
 
         for recipient in recipients:
-            msg = MIMEMultipart()
+            msg = MIMEMultipart("alternative" if html_body is not None else "mixed")
             msg["From"] = SMTP_CONFIG["default_sender"]
             msg["To"] = recipient
             msg["Reply-To"] = "no-reply@gsa.gov"
             msg["Subject"] = subject
             msg.attach(MIMEText(body, "plain"))
+            if html_body is not None:
+                msg.attach(MIMEText(html_body, "html"))
 
             server.sendmail(SMTP_CONFIG["default_sender"], [recipient], msg.as_string())
             logger.info(f"Notification email sent to: {recipient}")
 
 
-def get_format_from_str(validation_msg: str) -> str:
+_VALIDATION_ERROR_WRAPPER_RE = re.compile(
+    r"^<(?:ValidationError|ValidationException):\s*(.*)>$", re.DOTALL
+)
+_ACCEPTABLE_FORMATS_PREFIX = "does not match any of the acceptable formats: "
+
+
+def parse_validation_message(message: str) -> tuple[Optional[str], str]:
     """
-    gets the format/rule used against the data (e.g. 'uri', 'string', some regex)
+    split a stored record error message into (field, rule).
+
+    validation messages are stored as `repr()` of a jsonschema
+    `ValidationError`, e.g.
+        <ValidationError: "$.license, 'center' does not match any of the
+        acceptable formats: 'uri', 'null'">
+    other message types (TransformationException, DCAT warnings, etc.) don't
+    have this shape and are returned as (None, message).
     """
-    if "is too long" in validation_msg:
-        match = re.search(r"\[maxLength=(\d+)\]", validation_msg)
-        if match:
-            return f"max string length of {match.group(1)} characters"
-        match = re.search(r"\[maxItems=(\d+)\]", validation_msg)
-        if match:
-            return f"max {match.group(1)} items"
-        return "max string length requirement"
+    wrapper_match = _VALIDATION_ERROR_WRAPPER_RE.match(message)
+    if not wrapper_match:
+        return None, message
 
-    # for constants where a single value is acceptable
-    if "was expected" in validation_msg:
-        return f"constant value {validation_msg}"
-    return validation_msg.split(" ")[-1]
+    try:
+        with warnings.catch_warnings():
+            # repr() embeds raw regex backslashes (e.g. the REDACTED format)
+            # that aren't valid escapes; literal_eval still parses them fine.
+            warnings.simplefilter("ignore", SyntaxWarning)
+            inner = ast.literal_eval(wrapper_match.group(1))
+    except (ValueError, SyntaxError):
+        inner = wrapper_match.group(1).strip("'\"")
+
+    json_path, _, rule_text = inner.partition(", ")
+    if not rule_text:
+        return None, message
+
+    field = json_path[2:] if json_path.startswith("$.") else json_path
+    if field in ("", "$"):
+        field = "(root)"
+    field = re.sub(r"\[\d+\]", "[]", field)
+
+    if rule_text.endswith("is a required property"):
+        rule = "required property"
+    elif _ACCEPTABLE_FORMATS_PREFIX in rule_text:
+        rule = rule_text.split(_ACCEPTABLE_FORMATS_PREFIX, 1)[1]
+    else:
+        rule = rule_text
+
+    return field, rule
 
 
-def found_simple_message(validation_error: ValidationError) -> bool:
+def group_record_error_fields(rows: list[tuple]) -> list[dict]:
     """
-    determine whether the input validation error represents the most
-    succinct cause for error based on its json_path or dtype
+    group (severity, type, message, count) rows into per-field/rule summaries
+    for the harvest job report. rows are pre-aggregated by exact message, so
+    identical (field, rule) pairs from different messages are merged here.
     """
-    # these are all the unique dtypes found in the
-    # non-federal schema (no different than federal)
-    # {"'boolean'", "'null'", "'array'", "'number'", "'object'", "'string'"}
+    severity_order = {"error": 0, "warning": 1}
+    grouped: dict[tuple, dict] = {}
 
-    # the required field at the root is missing entirely
-    if validation_error.json_path == "$":
-        return True
-
-    # we need to dig a little deeper when it's a list
-    if isinstance(validation_error.instance, (dict, list)):
-        # if it's empty you'll get something like
-        # ['$.keyword', '[] should be non-empty']
-        # which is simple and what we want
-        if len(validation_error.instance) == 0:
-            return True
-        # If it's looking for maxItems, you may have
-        # any number of items in the array:
-        if validation_error.validator == "maxItems":
-            return True
-
-        if validation_error.message.endswith("is a required property"):
-            return True
-
-        return False
-    return True
-
-
-def is_required_property(messages: str) -> bool:
-    for message in messages:
-        if "is a required property" in message:
-            return True
-
-    return False
-
-
-def finalize_validation_messages(messages: defaultdict) -> list:
-    """
-    build the final validation messages either individually (root) or
-    bundled by field. see tests for output.
-
-    the input default dict is organized by { json_path: [errors...]} format
-        { "$": [ "'a' is required", "'b' is required" ],
-          "$.keyword": [ "[] should be non-empty", "[] is not of type 'string'" ],
-          "$.contactPoint.hasEmail": [ format1, format2, format3, etc...]
-        }
-
-    the regex says: get me the first word(s) in single quotes or just empty brackets [].
-    what's inside the single quotes represents the invalid data
-    """
-
-    output = []
-
-    for json_path, formats in messages.items():
-        # required property messages aren't based on format but simply
-        # "[field] is a required property"
-        if is_required_property(formats):
-            output += map(
-                lambda error: ValidationError(f"{json_path}, {error}"),
-                messages[json_path],
-            )
-            continue
-
-        # all other errors are bundled based on the formats/rules
-
-        # constants like in "accrualPeriodicity" don't include the invalid data
-        # but >1 format/rule is used against it so grabbing
-        # the last one which is a regex and does include the invalid data
-        # excluding constants [0] == [n]
-        if formats[-1].startswith("None"):
-            invalid_value = "None"
+    for severity, error_type, message, count in rows:
+        if error_type in ("ValidationError", "ValidationException"):
+            field, rule = parse_validation_message(message)
         else:
-            invalid_value = re.search(r"'(.*?)'|\[\]", formats[-1]).group(0)
+            field, rule = None, error_type
 
-        # if the 0th doesn't work none of them will
-        if invalid_value is None:
-            logger.warning(f"can't find invalid data from error message: {formats[0]}")
-            continue
-
-        # @type values are consts too
-        if invalid_value in [
-            "'dcat:Distribution'",
-            "'org:Organization'",
-            "'dcat:Dataset'",
-            "'vcard:Contact'",
-        ]:
-            invalid_value = "@type value"
-
-        formats = map(get_format_from_str, formats)
-
-        # build the bundled error message by json_path
-        msg = ValidationError(
-            f"{json_path}, {invalid_value} does not match any of "
-            "the acceptable formats: " + ", ".join(formats)
+        key = (severity, field, rule)
+        entry = grouped.setdefault(
+            key,
+            {
+                "severity": severity,
+                "field": field,
+                "rule": rule,
+                "type": error_type,
+                "count": 0,
+                "examples": [],
+            },
         )
-        output.append(msg)
+        entry["count"] += count
+        if len(entry["examples"]) < 3:
+            entry["examples"].append(message)
 
-    return output
+    return sorted(
+        grouped.values(),
+        key=lambda entry: (
+            severity_order.get(entry["severity"], 2),
+            -entry["count"],
+        ),
+    )
 
 
-def assemble_validation_errors(validation_errors: list, messages=None) -> list:  #
+def build_report_email_section(
+    error_field_summary: list[dict], sample_datasets: list, catalog_base_url: str
+) -> str:
     """
-    given a list of errors, follow each one recursively through its context
-    and get the simplest cause for error. store the error in a defaultdict
-    such that { json_path: [errors...]}
-
-    errors with lists or dicts (other than empty)
-    will often return the entire object followed by 'is not valid under any
-    of the given schemas' which isn't helpful.
+    Plain-text rendering of the /report page's issues-by-field and sample
+    dataset sections, for inlining into the harvest job notification email.
     """
+    lines = ["Issues by field:"]
+    if not error_field_summary:
+        lines.append("- No record errors or warnings found.")
+    else:
+        for row in error_field_summary:
+            field = row["field"] or "(root)"
+            lines.append(
+                f"- {row['severity']}: {field} - {row['rule']} ({row['count']})"
+            )
 
-    if messages is None:
-        # {'$.distribution[2].title' = ["'' should be non-empty", etc...]}
-        messages = defaultdict(list)
-
-    for error in validation_errors:
-        if found_simple_message(error):
-            # these aren't specific enough which make them unhelpful
-            generic_msg = "is not valid under any of the given schemas"
-            is_generic_msg = error.message.endswith(generic_msg)
-            if error.validator == "maxLength":
-                formatted_message = (
-                    f"{error.message} [maxLength={error.validator_value}]"
-                )
-            elif error.validator == "maxItems":
-                formatted_message = (
-                    f"{error.message} [maxItems={error.validator_value}]"
+    lines.append("")
+    lines.append("Sample datasets:")
+    if not sample_datasets:
+        lines.append("- No datasets have been harvested from this source yet.")
+    else:
+        for dataset in sample_datasets:
+            if catalog_base_url:
+                lines.append(
+                    f"- {dataset.slug}: {catalog_base_url}/dataset/{dataset.slug}"
                 )
             else:
-                formatted_message = error.message
-            # if not the generic message, and if the message is not already
-            # present in the list for the given path we skip to avoid duplicates
-            # based on how messages are returned from the validator
-            if (
-                not is_generic_msg
-                and formatted_message not in messages[error.json_path]
-            ):
-                messages[error.json_path].append(formatted_message)
-        assemble_validation_errors(error.context, messages)
+                lines.append(f"- {dataset.slug}")
 
-    return finalize_validation_messages(messages)
+    return "\n".join(lines)
 
 
 def is_valid_uuid4(uuid_string) -> bool:
@@ -1559,31 +1817,3 @@ def is_valid_uuid4(uuid_string) -> bool:
         AttributeError
     ):  # Catches cases where input might not be a string (e.g., UUID(0))
         return False
-
-
-def build_dcatus3_validator(
-    definitions_dir,
-    root_ref="https://resources.data.gov/dcat-us/3.0.0/definitions/catalog",
-):
-    """
-    builds a dcatus v3.0 validator based on schema files in [definitions_dir].
-
-    root_ref selects the entry point into the schema definitions. it defaults to
-    the catalog definition (used by the validator web tool to validate a whole
-    catalog), but can be pointed at the dataset definition so the validator can
-    check a single dataset record at a time during harvest.
-    """
-    registry = Registry()
-
-    for schema_file in definitions_dir.glob("*.json"):
-        schema = open_json(schema_file)
-        registry = registry.with_resource(
-            uri=schema["$id"],
-            resource=DRAFT202012.create_resource(schema),
-        )
-
-    return Draft202012Validator(
-        schema={"$ref": root_ref},
-        registry=registry,
-        format_checker=FormatChecker(),
-    )

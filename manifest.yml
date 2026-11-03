@@ -14,6 +14,7 @@ applications:
     env:
       EXTERNAL_ROUTE: ((route_external))
       INTERNAL_ROUTE: ((route_internal))
+      VALIDATOR_INTERNAL_ROUTE: ((route_internal_validator))
       BASIC_AUTH_ENABLED: ((basic_auth_enabled))
 
   - &harvest_app
@@ -47,7 +48,9 @@ applications:
       NEW_RELIC_HOST: gov-collector.newrelic.com
       NEW_RELIC_MONITOR_MODE: ((new_relic_monitor_mode))
       NEW_RELIC_CONFIG_FILE: /home/vcap/app/config/newrelic.ini
+      NEW_RELIC_MONITOR_DB_ACTIVITY: ((new_relic_monitor_db_activity))
       ASSET_VERSION: ((asset_version))
+      SERVED_BY: ((app_name))
     command: ./app-start.sh
 
   - <<: *harvest_app
@@ -59,3 +62,35 @@ applications:
       - ((harvest_service_name))-secrets
       - ((opensearch_service_name))
       - logstack-space-drain
+
+  # The public DCAT-US validation API (validator_api/), proxied here by
+  # datagov-harvest-proxy for /api/validate, /api/v1/validate and its docs at
+  # /validator/docs. The admin app's /validate/ page submits to it from the
+  # browser, so validation load and its server-side URL fetching never run on
+  # the admin app's workers (GSA/data.gov#6293). A separate, minimal WSGI app:
+  # it imports only dcatus_validation, so it needs no database, admin secrets
+  # or CF credentials - only the New Relic key in -validator-secrets.
+  - name: ((app_name))-validator
+    buildpacks:
+      - python_buildpack
+    routes:
+      - route: ((route_internal_validator))
+    services:
+      - ((app_name))-validator-secrets
+      - logstack-space-drain
+    instances: ((validator_instances))
+    memory: ((validator_memory_quota))
+    disk_quota: ((validator_disk_quota))
+    health-check-type: http
+    health-check-http-endpoint: /health
+    env:
+      # the docs' "Try it out" server, so it goes through the proxy
+      EXTERNAL_ROUTE: ((route_external))
+      NEW_RELIC_APP_NAME: ((app_name))-validator-((space_name))
+      NEW_RELIC_HOST: gov-collector.newrelic.com
+      NEW_RELIC_MONITOR_MODE: ((new_relic_monitor_mode))
+      NEW_RELIC_CONFIG_FILE: /home/vcap/app/config/newrelic.ini
+      # Lets synthetic monitoring confirm a request forwarded by the proxy
+      # reached this app (X-Served-By).
+      SERVED_BY: ((app_name))-validator
+    command: ./validator-start.sh
